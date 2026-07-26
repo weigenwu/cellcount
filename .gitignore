@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .cellscope-server.*.log
+.pages-test.*.log
 *_cell-count-results/
 20260726HCC1954-nk/
 *.tif

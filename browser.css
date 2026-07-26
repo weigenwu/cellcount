@@ -1,0 +1,20 @@
+.file-button { display: inline-flex; align-items: center; justify-content: center; }
+.file-button input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.browser-notes { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12vh; }
+.browser-notes span { color: #8a97a8; border: 1px solid #253041; border-radius: 999px; padding: 8px 12px; font-size: 11px; background: rgba(14, 19, 27, .7); }
+.browser-notes b { color: #7394ff; margin-right: 6px; }
+#imageCanvas { display: block; width: 100%; height: 100%; }
+.decode-busy { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 12px; background: rgba(5,7,10,.65); color: #9ba8b8; font-size: 11px; z-index: 4; backdrop-filter: blur(3px); }
+.decode-busy i { width: 25px; height: 25px; border: 2px solid #2a3545; border-top-color: #6b87ff; border-radius: 50%; animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.status-dot.cancelled { background: #ffbe48; }
+.status-dot.partial { background: #7a68ff; }
+.browser-badge { color: #8fa0b6; font-size: 9px; }
+.target-picker { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; background: #0a0f16; border: 1px solid var(--line); padding: 4px; border-radius: 10px; margin: 15px 0 9px; }
+.target-picker button { border: 0; background: transparent; color: #77869a; padding: 9px 5px; border-radius: 7px; cursor: pointer; font-size: 10px; }
+.target-picker button.active { background: #202a39; color: white; box-shadow: inset 0 0 0 1px #344155; }
+.sample-button { width: 100%; margin: 3px 0 7px; border-color: #3f5490; color: #b7c5ff; background: #151d31; }
+@media (max-width: 700px) {
+  .welcome { padding: 9vh 22px; }
+  .browser-notes { margin-top: 8vh; }
+}

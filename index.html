@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; worker-src 'self' blob:; connect-src 'self' https://cdn.jsdelivr.net">
+  <title>CellScope · 浏览器细胞计数</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="static/styles.css">
+  <link rel="stylesheet" href="browser.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+      <div><strong>CellScope</strong><small>浏览器荧光细胞计数</small></div>
+    </div>
+    <div class="privacy-pill"><span></span>浏览器本地计算 · 图片不会上传</div>
+    <div class="top-actions">
+      <label class="button ghost file-button">导入项目<input id="projectInput" type="file" accept=".json"></label>
+      <label class="button primary file-button">选择实验文件夹<input id="folderInput" type="file" webkitdirectory multiple accept=".tif,.tiff,.png,.jpg,.jpeg,.xml"></label>
+    </div>
+  </header>
+
+  <main id="appShell" class="app-shell empty">
+    <section id="welcome" class="welcome">
+      <div class="welcome-glow"></div>
+      <div class="eyebrow">ZERO-UPLOAD FLUORESCENCE WORKBENCH</div>
+      <h1>打开网页，选择文件夹，<br><em>直接开始细胞计数。</em></h1>
+      <p>无需安装软件。DAPI、NK 和肿瘤通道仅在你的浏览器中读取与分析，不会上传到服务器。</p>
+      <div class="welcome-actions">
+        <label class="button primary large file-button">选择 Leica 图片文件夹<input id="welcomeFolderInput" type="file" webkitdirectory multiple accept=".tif,.tiff,.png,.jpg,.jpeg,.xml"></label>
+        <button class="button ghost large" id="mappingToggleBtn">自定义通道后缀</button>
+      </div>
+      <div id="mappingPanel" class="mapping-panel hidden">
+        <label><span class="dot blue"></span>DAPI 后缀<input id="suffixDapi" value="_ch00"></label>
+        <label><span class="dot green"></span>NK 后缀<input id="suffixNk" value="_ch01"></label>
+        <label><span class="dot red"></span>肿瘤后缀<input id="suffixTumor" value="_ch02"></label>
+      </div>
+      <div class="browser-notes">
+        <span><b>01</b>选择整个实验文件夹</span>
+        <span><b>02</b>校准每组参数</span>
+        <span><b>03</b>逐张或批量分析</span>
+        <span><b>04</b>人工复核并导出</span>
+      </div>
+    </section>
+
+    <aside id="sidebar" class="sidebar hidden">
+      <div class="project-heading">
+        <span class="eyebrow">当前项目</span>
+        <h2 id="projectName">—</h2>
+        <p id="projectMeta">—</p>
+      </div>
+      <div class="sidebar-label">实验组与视野</div>
+      <div id="groupList" class="group-list"></div>
+    </aside>
+
+    <section id="workspace" class="workspace hidden">
+      <div class="workspace-toolbar">
+        <div>
+          <span class="eyebrow" id="currentGroupLabel">实验组</span>
+          <h2 id="currentViewLabel">请选择视野</h2>
+        </div>
+        <div class="channel-tabs" id="channelTabs">
+          <button data-channel="overlay" class="active">合并</button>
+          <button data-channel="dapi"><span class="dot blue"></span>DAPI</button>
+          <button data-channel="nk"><span class="dot green"></span>NK</button>
+          <button data-channel="tumor"><span class="dot red"></span>肿瘤</button>
+        </div>
+        <div class="viewer-actions">
+          <button class="icon-button" id="zoomOutBtn" title="缩小">−</button>
+          <span id="zoomLabel">100%</span>
+          <button class="icon-button" id="zoomInBtn" title="放大">＋</button>
+          <button class="icon-button text" id="fitBtn">适应</button>
+        </div>
+      </div>
+
+      <div id="viewer" class="viewer">
+        <div id="imageStage" class="image-stage">
+          <canvas id="imageCanvas"></canvas>
+          <canvas id="overlayCanvas"></canvas>
+        </div>
+        <div id="viewerEmpty" class="viewer-empty">选择左侧视野以查看图像</div>
+        <div id="decodeBusy" class="decode-busy hidden"><i></i><span>正在读取本地图片…</span></div>
+        <div class="legend">
+          <button data-class="dapi" class="active"><span class="blue"></span>DAPI</button>
+          <button data-class="nk" class="active"><span class="green"></span>NK</button>
+          <button data-class="tumor" class="active"><span class="red"></span>肿瘤</button>
+        </div>
+      </div>
+
+      <div class="review-bar">
+        <div class="review-mode">
+          <span>人工复核</span>
+          <button id="selectModeBtn" class="active">选择标记</button>
+          <button id="addModeBtn">添加细胞</button>
+        </div>
+        <div class="selection-actions">
+          <span id="selectionHint">点击标记后可删除；添加会计入当前类别</span>
+          <button id="deleteDetectionBtn" class="danger">删除</button>
+        </div>
+      </div>
+
+      <div class="results-panel">
+        <div class="panel-heading">
+          <div><span class="eyebrow">RESULTS</span><h3>批量结果</h3></div>
+          <div class="results-actions">
+            <button class="button ghost" id="annotatedBtn">保存当前标注图</button>
+            <button class="button primary" id="exportBtn">导出 CSV + 项目</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>实验组 / 视野</th><th>DAPI</th><th>NK</th><th>肿瘤</th><th>修正</th><th>三类进度</th></tr></thead>
+            <tbody id="resultsBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <aside id="controlPanel" class="control-panel hidden">
+      <div class="control-head">
+        <div><span class="eyebrow">ANALYSIS PROFILE</span><h2>分析参数</h2></div>
+        <span id="pixelSizeBadge" class="unit-badge">0.218 µm/px</span>
+      </div>
+      <div class="target-picker" id="targetPicker">
+        <button data-target="dapi" class="active"><span class="dot blue"></span>DAPI</button>
+        <button data-target="nk"><span class="dot green"></span>NK</button>
+        <button data-target="tumor"><span class="dot red"></span>肿瘤</button>
+      </div>
+      <div class="profile-scope">
+        <span>当前预设</span><strong id="profileGroup">—</strong>
+        <button id="applyAllBtn">应用到全部组</button>
+      </div>
+
+      <details open>
+        <summary><span id="targetDot" class="dot blue"></span><span id="targetParameterTitle">DAPI 独立计数参数</span></summary>
+        <div class="fields">
+          <label class="full">阈值模式<select id="thresholdMode"><option value="manual">手动范围</option><option value="auto">Otsu 自动</option></select></label>
+          <label>下限<input id="thresholdLow" type="number" min="0" max="255"></label>
+          <label>上限<input id="thresholdHigh" type="number" min="0" max="255"></label>
+          <label>最小面积 <small>px²</small><input id="minArea" type="number" min="1"></label>
+          <label>最大面积 <small>px²</small><input id="maxArea" type="number" min="1"></label>
+          <label>最小圆度<input id="minCircularity" type="number" min="0" max="1" step="0.01"></label>
+          <label>最大圆度<input id="maxCircularity" type="number" min="0" max="1" step="0.01"></label>
+          <label>平滑半径<input id="gaussianSigma" type="number" min="0" max="5" step="1"></label>
+          <label>分水岭距离<input id="watershedDistance" type="number" min="1"></label>
+        </div>
+        <p id="areaConversion" class="parameter-note">400 px² ≈ 19.0 µm²</p>
+      </details>
+
+      <button class="button sample-button" id="randomSampleBtn">随机抽取当前组一张预跑</button>
+      <button class="button save-profile" id="saveProfileBtn">保存当前类别参数</button>
+      <div class="count-cards">
+        <article><span>DAPI 总数</span><strong id="countDapi">—</strong></article>
+        <article class="nk"><span>NK 细胞</span><strong id="countNk">—</strong></article>
+        <article class="tumor"><span>肿瘤细胞</span><strong id="countTumor">—</strong></article>
+        <article class="review"><span>当前计数对象</span><strong id="currentTargetName">DAPI</strong></article>
+      </div>
+      <div class="batch-actions">
+        <button class="button primary" id="analyzeCurrentBtn">预跑当前图片</button>
+        <button class="button ghost" id="analyzeGroupBtn">批量当前组</button>
+        <button class="button ghost full" id="analyzeAllBtn">批量全部视野（当前类别）</button>
+        <button class="button ghost full" id="resumeBtn">继续当前类别未完成视野</button>
+      </div>
+      <div id="jobPanel" class="job-panel hidden">
+        <div><span id="jobTitle">正在分析</span><b id="jobPercent">0%</b></div>
+        <div class="progress"><i id="jobProgress"></i></div>
+        <p id="jobCurrent">准备中…</p>
+        <button id="cancelBtn">停止批处理</button>
+      </div>
+      <p class="calibration-warning">推荐顺序：选择 DAPI → 随机预跑 → 保存阈值 → 批量；然后对 NK、肿瘤分别重复。三类参数互不覆盖。</p>
+    </aside>
+  </main>
+
+  <div id="toast" class="toast"></div>
+  <script src="https://cdn.jsdelivr.net/npm/utif@3.1.0/UTIF.min.js" crossorigin="anonymous"></script>
+  <script src="browser-app.js"></script>
+</body>
+</html>

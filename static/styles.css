@@ -91,7 +91,7 @@ button { color: inherit; }
 .legend button { border: 0; background: transparent; color: #8d9aaa; font-size: 10px; padding: 6px 7px; cursor: pointer; opacity: .38; }
 .legend button.active { opacity: 1; }
 .legend span { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 4px; }
-.legend .red { background: var(--red); }.legend .green { background: var(--green); }.legend .amber { background: var(--amber); }.legend .cyan { background: var(--cyan); }
+.legend .red { background: var(--red); }.legend .green { background: var(--green); }.legend .blue { background: var(--blue); }.legend .amber { background: var(--amber); }.legend .cyan { background: var(--cyan); }
 .review-bar { min-height: 54px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; align-items: center; padding: 8px 15px; gap: 14px; background: #0e141d; }
 .review-mode, .selection-actions { display: flex; align-items: center; gap: 5px; font-size: 10px; }
 .review-mode > span, .selection-actions > span { color: var(--muted); margin-right: 5px; }
@@ -156,4 +156,3 @@ summary::-webkit-details-marker { display: none; }
   .control-panel { grid-column: 1 / -1; position: static; max-height: none; }
   .top-actions, .brand { min-width: auto; }
 }
-
