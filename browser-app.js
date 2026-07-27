@@ -22,9 +22,11 @@ const state = {
   cancelled: false, cancelReject: null, pendingProject: null, busy: false,
   inspectionMode: "original", showLabels: true, rawImage: null,
   visibleClasses: new Set(["dapi", "tumor", "nk"]),
+  selectedGroups: new Set(),
 };
 const $ = id => document.getElementById(id);
 const colors = {dapi:"#4d7cff", tumor:"#ff4a5b", nk:"#41e090"};
+const channelCodes = {dapi:"ch00", nk:"ch01", tumor:"ch02"};
 const supported = new Set([".tif", ".tiff", ".png", ".jpg", ".jpeg"]);
 function targetLabel(target) {
   return state.project?.channel_labels?.[target] || DEFAULT_CHANNEL_LABELS[target];
@@ -99,6 +101,7 @@ async function scanFolder(fileList) {
     ])),
     results:{}, created_at:new Date().toISOString(),
   };
+  state.selectedGroups=new Set(groups);
   mergePendingProject();
   openWorkspace();
   $("folderInput").value = "";
@@ -113,6 +116,9 @@ function mergePendingProject() {
     return;
   }
   state.project.channel_labels = {...DEFAULT_CHANNEL_LABELS, ...(saved.channel_labels || {})};
+  if (Array.isArray(saved.selected_groups)) {
+    state.selectedGroups=new Set(saved.selected_groups.filter(group=>state.project.groups.includes(group)));
+  }
   for (const group of state.project.groups) {
     const savedGroup = saved.parameters_by_group?.[group];
     if (!savedGroup) continue;
@@ -176,7 +182,7 @@ function renderGroups() {
     const wrapper = document.createElement("div");
     wrapper.className = "group";
     const views = groupViews(group);
-    wrapper.innerHTML = `<button class="group-header"><strong>${escapeHtml(group)}</strong><small>${views.length}</small></button><div class="view-list"></div>`;
+    wrapper.innerHTML = `<div class="group-header"><label class="group-select" title="选择此文件夹进行批量处理"><input type="checkbox" ${state.selectedGroups.has(group)?"checked":""}></label><button class="group-toggle"><strong>${escapeHtml(group)}</strong><small>${views.length}</small></button></div><div class="view-list"></div>`;
     const list = wrapper.querySelector(".view-list");
     views.forEach(view => {
       view.status = overallStatus(view);
@@ -186,9 +192,17 @@ function renderGroups() {
       button.onclick = () => selectView(view.id);
       list.appendChild(button);
     });
-    wrapper.querySelector(".group-header").onclick = () => list.classList.toggle("hidden");
+    wrapper.querySelector(".group-select input").onchange=event=>{
+      event.target.checked?state.selectedGroups.add(group):state.selectedGroups.delete(group);
+      updateSelectedGroupCount();
+    };
+    wrapper.querySelector(".group-toggle").onclick = () => list.classList.toggle("hidden");
     $("groupList").appendChild(wrapper);
   });
+  updateSelectedGroupCount();
+}
+function updateSelectedGroupCount() {
+  $("selectedGroupCount").textContent=`${state.selectedGroups.size} / ${state.project?.groups.length||0} 个已选`;
 }
 
 async function selectView(id) {
@@ -254,14 +268,13 @@ function fitStage(width, height) {
   setZoom(1);
 }
 
-function buildAcceptedMask() {
-  const source = $("overlayCanvas");
+function buildDetectionMask(width, height, detections, visibleClasses=null) {
   const mask = document.createElement("canvas");
-  mask.width = source.width; mask.height = source.height;
+  mask.width = width; mask.height = height;
   const context = mask.getContext("2d");
   context.fillStyle = "#fff";
-  for (const item of state.detections) {
-    if (item.deleted || !state.visibleClasses.has(item.classification)) continue;
+  for (const item of detections) {
+    if (item.deleted || (visibleClasses && !visibleClasses.has(item.classification))) continue;
     if (item.runs?.length) {
       for (let i=0; i<item.runs.length; i+=3) {
         const y=item.runs[i], start=item.runs[i+1], end=item.runs[i+2];
@@ -274,6 +287,11 @@ function buildAcceptedMask() {
     }
   }
   return mask;
+}
+
+function buildAcceptedMask() {
+  const source = $("overlayCanvas");
+  return buildDetectionMask(source.width,source.height,state.detections,state.visibleClasses);
 }
 
 function tintMask(mask, color) {
@@ -451,9 +469,10 @@ async function analyzeScope(scope) {
   const target = state.target;
   let views = scope === "current" ? [viewById(state.currentViewId)] :
     scope === "group" ? groupViews(state.currentGroup) :
-    scope === "pending" ? state.project.views.filter(view => targetStatus(view.id,target) !== "done") : state.project.views;
+    scope === "pending" ? state.project.views.filter(view => state.selectedGroups.has(view.group) && targetStatus(view.id,target) !== "done") :
+    state.project.views.filter(view=>state.selectedGroups.has(view.group));
   views = views.filter(view => !view.error);
-  if (!views.length) return toast("没有未完成且可分析的视野");
+  if (!views.length) return toast(scope==="all"||scope==="pending"?"请先勾选至少一个有可分析视野的文件夹":"没有未完成且可分析的视野",true);
   const label = targetLabel(target);
   if (views.some(view => countTargetDetections(targetResult(view.id,target)?.detections||[]).corrected > 0)) {
     const guidance = target === "dapi"
@@ -531,8 +550,8 @@ function updateActionLabels() {
   const label=targetLabel(state.target);
   $("analyzeCurrentBtn").textContent=`预跑当前图片（${label}）`;
   $("analyzeGroupBtn").textContent=`批量当前组（${label}）`;
-  $("analyzeAllBtn").textContent=`批量全部视野（${label}）`;
-  $("resumeBtn").textContent=`继续 ${label} 未完成视野`;
+  $("analyzeAllBtn").textContent=`批量已选文件夹（${label}）`;
+  $("resumeBtn").textContent=`继续已选文件夹的 ${label}`;
 }
 function renderResults() {
   if (!state.project) return;
@@ -594,6 +613,7 @@ function serializableProject() {
   return {
     version:1,browserVersion:true,name:state.project.name,pixel_size_um:state.project.pixel_size_um,
     suffixes:state.project.suffixes,channel_labels:state.project.channel_labels,
+    selected_groups:[...state.selectedGroups],
     groups:state.project.groups,parameters_by_group:state.project.parameters_by_group,
     views:state.project.views.map(({id,group,name,width,height,status,error,fileNames})=>({id,group,name,width,height,status,error,fileNames})),
     results:serializedResults,updated_at:new Date().toISOString(),
@@ -634,7 +654,58 @@ function downloadBlob(blob,name) {
   link.href=url;link.download=name;document.body.appendChild(link);link.click();link.remove();
   setTimeout(()=>URL.revokeObjectURL(url),1000);
 }
-function csvText() {
+function safeFileName(value) {
+  return String(value).replace(/[<>:"/\\|?*\u0000-\u001f]/g,"_").replace(/[. ]+$/g,"").trim() || "unnamed";
+}
+async function writeLocalFile(directory,name,data) {
+  const handle=await directory.getFileHandle(safeFileName(name),{create:true});
+  const writable=await handle.createWritable();
+  await writable.write(data);
+  await writable.close();
+}
+async function nestedDirectory(directory,path) {
+  let current=directory;
+  for (const segment of String(path).split(/[\\/]+/).filter(Boolean)) {
+    current=await current.getDirectoryHandle(safeFileName(segment),{create:true});
+  }
+  return current;
+}
+function safeRelativePath(path) {
+  return String(path).split(/[\\/]+/).filter(Boolean).map(safeFileName).join("/");
+}
+function canvasBlob(canvas) {
+  return new Promise((resolve,reject)=>canvas.toBlob(
+    blob=>blob?resolve(blob):reject(new Error("无法生成 PNG")),
+    "image/png"
+  ));
+}
+async function annotatedBlob(view,target) {
+  const decoded=await decodeRgba(view.files[target]);
+  const canvas=document.createElement("canvas");
+  canvas.width=decoded.width;canvas.height=decoded.height;
+  const context=canvas.getContext("2d");
+  context.putImageData(new ImageData(decoded.rgba,decoded.width,decoded.height),0,0);
+  const detections=(targetResult(view.id,target)?.detections||[]).filter(item=>!item.deleted);
+  const mask=buildDetectionMask(decoded.width,decoded.height,detections);
+  context.drawImage(outlineMask(mask,colors[target],2),0,0);
+  detections.forEach((item,index)=>{
+    const fontSize=Math.max(13,Math.min(24,(item.radius||12)*0.8));
+    context.font=`700 ${fontSize}px system-ui`;
+    context.textAlign="center";context.textBaseline="middle";context.lineWidth=3;
+    context.strokeStyle="rgba(0,0,0,.85)";context.fillStyle="#fff";
+    context.strokeText(String(index+1),item.x,item.y);
+    context.fillText(String(index+1),item.x,item.y);
+  });
+  const title=`${view.group} / ${view.name} · ${targetLabel(target)} · n=${detections.length}`;
+  context.font="700 22px system-ui";context.textAlign="left";context.textBaseline="top";
+  const titleWidth=Math.min(decoded.width-24,context.measureText(title).width+28);
+  context.fillStyle="rgba(0,0,0,.72)";context.fillRect(12,12,titleWidth,44);
+  context.fillStyle="#fff";context.fillText(title,26,23,decoded.width-52);
+  const blob=await canvasBlob(canvas);
+  canvas.width=1;canvas.height=1;mask.width=1;mask.height=1;
+  return blob;
+}
+function csvText(views=state.project.views) {
   const headers=[
     "实验组","视野",
     ...TARGETS.map(target=>`${targetLabel(target)}总数`),
@@ -642,7 +713,7 @@ function csvText() {
     ...TARGETS.map(target=>`${targetLabel(target)}状态`),
     "错误"
   ];
-  const rows=state.project.views.map(view=>{
+  const rows=views.map(view=>{
     const c=viewCounts(view.id);
     return [
       view.group,view.name,
@@ -657,10 +728,96 @@ function csvText() {
   const quote=value=>`"${String(value).replaceAll('"','""')}"`;
   return "\ufeff"+[headers,...rows].map(row=>row.map(quote).join(",")).join("\r\n");
 }
-function exportResults() {
+function downloadSummaryFiles() {
   downloadBlob(new Blob([csvText()],{type:"text/csv;charset=utf-8"}),`${state.project.name}-cell-count-results.csv`);
   setTimeout(()=>downloadBlob(new Blob([JSON.stringify(serializableProject(),null,2)],{type:"application/json"}),`${state.project.name}-cell-count-project.json`),250);
-  toast("已导出 CSV 和项目 JSON");
+}
+async function exportResults() {
+  if (!state.project || state.busy) return;
+  const processedGroups=state.project.groups.filter(group=>
+    groupViews(group).some(view=>TARGETS.some(target=>targetStatus(view.id,target)!=="pending"))
+  );
+  if (!processedGroups.length) return toast("还没有处理完成的文件夹，请先运行至少一个通道",true);
+  if (!window.showDirectoryPicker) {
+    downloadSummaryFiles();
+    return toast("已导出 CSV 和项目 JSON；批量标注图文件夹需要使用最新版 Chrome 或 Edge",true);
+  }
+  let parent;
+  try {
+    parent=await window.showDirectoryPicker({mode:"readwrite"});
+  } catch(error) {
+    if (error.name!=="AbortError") toast(`无法选择导出目录：${error.message}`,true);
+    return;
+  }
+  state.busy=true;state.cancelled=false;
+  $("jobPanel").classList.remove("hidden");
+  $("cancelBtn").textContent="停止导出";
+  const errors=[];
+  try {
+    const root=await parent.getDirectoryHandle(`${safeFileName(state.project.name)}_cell-count-results`,{create:true});
+    const processedViews=state.project.views.filter(view=>processedGroups.includes(view.group));
+    await writeLocalFile(root,"全部文件夹汇总.csv",new Blob([csvText(processedViews)],{type:"text/csv;charset=utf-8"}));
+    await writeLocalFile(root,"项目.json",new Blob([JSON.stringify(serializableProject(),null,2)],{type:"application/json"}));
+    const mirrored=await root.getDirectoryHandle("按原目录排列",{create:true});
+    const groupOutputs=new Map();
+    for (const group of processedGroups) {
+      const groupDir=await nestedDirectory(mirrored,group);
+      const groupErrors=[];
+      await writeLocalFile(groupDir,"计数结果.csv",new Blob([csvText(groupViews(group))],{type:"text/csv;charset=utf-8"}));
+      groupOutputs.set(group,{
+        directory:groupDir,
+        annotations:await groupDir.getDirectoryHandle("标注图",{create:true}),
+        errors:groupErrors,
+      });
+    }
+    const tasks=[];
+    for (const view of processedViews) {
+      for (const target of TARGETS) {
+        if (targetStatus(view.id,target)==="done" && view.files[target]) tasks.push({view,target});
+        else {
+          const message=`${view.group} / ${view.name} / ${targetLabel(target)}：${targetStatus(view.id,target)}`;
+          errors.push(message);groupOutputs.get(view.group).errors.push(message);
+        }
+      }
+    }
+    const manifest=[["实验组","视野","通道","计数","文件","状态","错误"]];
+    const started=performance.now();
+    for (let index=0;index<tasks.length;index++) {
+      if (state.cancelled) break;
+      const {view,target}=tasks[index];
+      const percent=Math.round(index/tasks.length*100);
+      $("jobTitle").textContent=`正在导出标注图 ${index+1}/${tasks.length}`;
+      $("jobPercent").textContent=`${percent}%`;$("jobProgress").style.width=`${percent}%`;
+      $("jobCurrent").textContent=`${view.group} / ${view.name} · ${targetLabel(target)}`;
+      try {
+        const output=groupOutputs.get(view.group);
+        const fileName=`${safeFileName(view.name)}__${safeFileName(targetLabel(target))}__${channelCodes[target]}__标注.png`;
+        await writeLocalFile(output.annotations,fileName,await annotatedBlob(view,target));
+        manifest.push([view.group,view.name,targetLabel(target),viewCounts(view.id)[target].total,`按原目录排列/${safeRelativePath(view.group)}/标注图/${fileName}`,"done",""]);
+      } catch(error) {
+        const message=`${view.group} / ${view.name} / ${targetLabel(target)}：${error.message}`;
+        errors.push(message);groupOutputs.get(view.group).errors.push(message);
+        manifest.push([view.group,view.name,targetLabel(target),"","","error",error.message]);
+      }
+      const elapsed=(performance.now()-started)/1000;
+      const remaining=elapsed/(index+1)*(tasks.length-index-1);
+      $("jobCurrent").textContent+=` · 剩余约 ${formatSeconds(remaining)}`;
+    }
+    const quote=value=>`"${String(value).replaceAll('"','""')}"`;
+    const manifestText="\ufeff"+manifest.map(row=>row.map(quote).join(",")).join("\r\n");
+    await writeLocalFile(root,"标注图清单.csv",new Blob([manifestText],{type:"text/csv;charset=utf-8"}));
+    await writeLocalFile(root,"错误报告.txt",new Blob([errors.length?errors.join("\r\n"):"无错误"],{type:"text/plain;charset=utf-8"}));
+    for (const output of groupOutputs.values()) {
+      await writeLocalFile(output.directory,"错误报告.txt",new Blob([output.errors.length?output.errors.join("\r\n"):"无错误"],{type:"text/plain;charset=utf-8"}));
+    }
+    toast(state.cancelled?"导出已停止；已完成文件保留在所选目录":"计数结果和全部已完成通道标注图已导出");
+  } catch(error) {
+    toast(`导出失败：${error.message}`,true);
+  } finally {
+    state.busy=false;
+    $("jobPanel").classList.add("hidden");
+    $("cancelBtn").textContent="停止批处理";
+  }
 }
 function exportAnnotated() {
   if (!$("imageCanvas").width) return;
@@ -745,6 +902,8 @@ async function randomSample() {
 [$("folderInput"),$("welcomeFolderInput")].forEach(input=>input.onchange=event=>scanFolder(event.target.files).catch(error=>{console.error(error);toast(error.message,true);}));
 $("projectInput").onchange=event=>event.target.files[0]&&importProject(event.target.files[0]);
 $("mappingToggleBtn").onclick=()=>$("mappingPanel").classList.toggle("hidden");
+$("selectAllGroupsBtn").onclick=()=>{state.selectedGroups=new Set(state.project.groups);renderGroups();};
+$("clearGroupsBtn").onclick=()=>{state.selectedGroups.clear();renderGroups();};
 $("saveChannelNamesBtn").onclick=saveChannelNames;
 $("saveProfileBtn").onclick=()=>saveParameters(false);$("applyAllBtn").onclick=()=>saveParameters(true);
 $("randomSampleBtn").onclick=randomSample;

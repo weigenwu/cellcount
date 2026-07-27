@@ -52,7 +52,12 @@
         <h2 id="projectName">—</h2>
         <p id="projectMeta">—</p>
       </div>
-      <div class="sidebar-label">实验组与视野</div>
+      <div class="sidebar-label">选择要批量处理的文件夹</div>
+      <div class="group-selection-actions">
+        <span id="selectedGroupCount">0 个已选</span>
+        <button id="selectAllGroupsBtn">全选</button>
+        <button id="clearGroupsBtn">清空</button>
+      </div>
       <div id="groupList" class="group-list"></div>
     </aside>
 
@@ -112,7 +117,7 @@
           <div><span class="eyebrow">RESULTS</span><h3>批量结果</h3></div>
           <div class="results-actions">
             <button class="button ghost" id="annotatedBtn">保存当前标注图</button>
-            <button class="button primary" id="exportBtn">导出 CSV + 项目</button>
+            <button class="button primary" id="exportBtn">导出结果 + 全部标注图</button>
           </div>
         </div>
         <div class="table-wrap">
