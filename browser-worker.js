@@ -30,7 +30,7 @@ async function decode(buffer, extension, channel) {
   context.drawImage(bitmap, 0, 0);
   const rgba = context.getImageData(0, 0, bitmap.width, bitmap.height).data;
   bitmap.close();
-  const output = new Uint8Array(bitmap.width * bitmap.height);
+  const output = new Uint8Array(canvas.width * canvas.height);
   const component = COMPONENT[channel];
   for (let i = 0, j = component; i < output.length; i++, j += 4) output[i] = rgba[j];
   return {data: output, width: canvas.width, height: canvas.height};
@@ -157,6 +157,19 @@ function distanceTransform(mask, width, height) {
   return distance;
 }
 
+function lineSaddle(distance, width, first, second) {
+  const steps = Math.max(Math.abs(first.x - second.x), Math.abs(first.y - second.y));
+  if (!steps) return Math.min(first.distance, second.distance);
+  let saddle = Math.min(first.distance, second.distance);
+  for (let step = 1; step < steps; step++) {
+    const ratio = step / steps;
+    const x = Math.round(first.x + (second.x - first.x) * ratio);
+    const y = Math.round(first.y + (second.y - first.y) * ratio);
+    saddle = Math.min(saddle, distance[y * width + x]);
+  }
+  return saddle;
+}
+
 function selectSeeds(mask, distance, width, height, minDistance) {
   const candidates = [];
   for (let y = 1; y < height - 1; y++) {
@@ -176,13 +189,27 @@ function selectSeeds(mask, distance, width, height, minDistance) {
   const cell = Math.max(1, minDistance);
   const grid = new Map();
   const selected = [];
+  let highestSelectedDistance = 0;
   for (const candidate of candidates) {
     const gx = Math.floor(candidate.x / cell), gy = Math.floor(candidate.y / cell);
+    const searchRadius = Math.ceil(Math.max(
+      minDistance,
+      1.5 * (highestSelectedDistance + candidate.distance) / 3
+    ) / cell);
     let blocked = false;
-    for (let oy = -1; oy <= 1 && !blocked; oy++) {
-      for (let ox = -1; ox <= 1 && !blocked; ox++) {
+    for (let oy = -searchRadius; oy <= searchRadius && !blocked; oy++) {
+      for (let ox = -searchRadius; ox <= searchRadius && !blocked; ox++) {
         for (const seed of grid.get(`${gx + ox},${gy + oy}`) || []) {
-          if ((seed.x - candidate.x) ** 2 + (seed.y - candidate.y) ** 2 < minDistance ** 2) blocked = true;
+          const adaptiveDistance = Math.max(
+            minDistance,
+            1.5 * (seed.distance + candidate.distance) / 3
+          );
+          const separation = (seed.x - candidate.x) ** 2 + (seed.y - candidate.y) ** 2;
+          if (separation < adaptiveDistance ** 2) {
+            const prominence = Math.min(seed.distance, candidate.distance) -
+              lineSaddle(distance, width, seed, candidate);
+            if (prominence < minDistance) blocked = true;
+          }
         }
       }
     }
@@ -191,6 +218,7 @@ function selectSeeds(mask, distance, width, height, minDistance) {
       const key = `${gx},${gy}`;
       if (!grid.has(key)) grid.set(key, []);
       grid.get(key).push(candidate);
+      highestSelectedDistance = Math.max(highestSelectedDistance, candidate.distance);
     }
   }
   return selected;
@@ -305,23 +333,56 @@ function positivity(signal, width, height, detection, radiusPx, threshold) {
   return {fraction: inner.length ? positive / inner.length : 0, background: baseline};
 }
 
+function segmentParticles(data, width, height, params) {
+  const smoothed = boxBlur(data, width, height, params.gaussian_sigma);
+  let mask = thresholdMask(smoothed, params);
+  mask = opening(mask, width, height, params.opening_radius);
+  const distance = distanceTransform(mask, width, height);
+  const seeds = selectSeeds(mask, distance, width, height, params.watershed_min_distance);
+  if (!seeds.length) return [];
+  const labels = floodLabels(mask, width, height, seeds);
+  const detections = regionDetections(labels, width, height, params);
+  attachMaskRuns(labels, width, height, detections);
+  return detections;
+}
+
 async function analyze(payload) {
   postProgress(`读取 ${payload.targetLabel} 通道`, 0.04);
   const channel = await decode(payload.channelBuffer, payload.channelExtension, payload.target);
   const {width, height} = channel;
-  postProgress("平滑与阈值", 0.16);
-  const smoothed = boxBlur(channel.data, width, height, payload.params.gaussian_sigma);
-  let mask = thresholdMask(smoothed, payload.params);
-  mask = opening(mask, width, height, payload.params.opening_radius);
-  postProgress("距离变换", 0.34);
-  const distance = distanceTransform(mask, width, height);
-  postProgress("寻找细胞核", 0.52);
-  const seeds = selectSeeds(mask, distance, width, height, payload.params.watershed_min_distance);
-  if (!seeds.length) return {detections: [], width, height};
-  const labels = floodLabels(mask, width, height, seeds);
-  postProgress("筛选颗粒", 0.76);
-  const detections = regionDetections(labels, width, height, payload.params);
-  attachMaskRuns(labels, width, height, detections);
+  let detections;
+  if (payload.target !== "dapi" && payload.params.analysis_mode === "nucleus_guided") {
+    let nuclei;
+    if (Array.isArray(payload.anchorDetections)) {
+      postProgress("复用第一通道计数与人工修正", 0.34);
+      nuclei = payload.anchorDetections;
+    } else {
+      postProgress("读取第一通道细胞核", 0.14);
+      const anchor = await decode(payload.anchorBuffer, payload.anchorExtension, "dapi");
+      if (anchor.width !== width || anchor.height !== height) throw new Error("第一通道与当前通道尺寸不一致");
+      postProgress("分割第一通道细胞核", 0.34);
+      nuclei = segmentParticles(anchor.data, width, height, payload.anchorParams);
+    }
+    postProgress("计算核周背景校正信号", 0.68);
+    detections = [];
+    for (const nucleus of nuclei) {
+      const signal = positivity(
+        channel.data, width, height, nucleus,
+        payload.params.ring_radius_px, payload.params.signal_threshold
+      );
+      if (signal.fraction < payload.params.positive_fraction) continue;
+      detections.push({
+        ...nucleus,
+        id:`auto-${detections.length + 1}`,
+        positive_fraction:signal.fraction,
+        signal_background:signal.background,
+      });
+    }
+  } else {
+    postProgress("平滑、阈值与自适应分水岭", 0.24);
+    detections = segmentParticles(channel.data, width, height, payload.params);
+  }
+  postProgress("筛选颗粒", 0.82);
   for (const detection of detections) {
     detection.classification = payload.target;
     detection.area_um2 = detection.area_px * payload.pixelSizeUm ** 2;

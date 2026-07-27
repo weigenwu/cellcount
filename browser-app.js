@@ -7,6 +7,15 @@ const DEFAULTS = {
 };
 const TARGETS = ["dapi", "nk", "tumor"];
 const DEFAULT_CHANNEL_LABELS = {dapi:"DAPI", nk:"NK", tumor:"肿瘤"};
+function defaultParams(target) {
+  return {
+    ...DEFAULTS,
+    analysis_mode:target === "dapi" ? "particles" : "nucleus_guided",
+    signal_threshold:target === "nk" ? 10 : 15,
+    positive_fraction:0.1,
+    ring_radius_px:6,
+  };
+}
 const state = {
   project: null, currentViewId: null, currentGroup: null, channel: "overlay", target: "dapi",
   detections: [], selectedId: null, mode: "select", zoom: 1, worker: null,
@@ -86,7 +95,7 @@ async function scanFolder(fileList) {
     groups, views,
     parameters_by_group:Object.fromEntries(groups.map(group => [
       group,
-      Object.fromEntries(TARGETS.map(target => [target, {...DEFAULTS}]))
+      Object.fromEntries(TARGETS.map(target => [target, defaultParams(target)]))
     ])),
     results:{}, created_at:new Date().toISOString(),
   };
@@ -109,10 +118,10 @@ function mergePendingProject() {
     if (!savedGroup) continue;
     if (savedGroup.dapi || savedGroup.nk || savedGroup.tumor) {
       for (const target of TARGETS) {
-        if (savedGroup[target]) state.project.parameters_by_group[group][target] = {...DEFAULTS, ...savedGroup[target]};
+        if (savedGroup[target]) state.project.parameters_by_group[group][target] = {...defaultParams(target), ...savedGroup[target]};
       }
     } else {
-      for (const target of TARGETS) state.project.parameters_by_group[group][target] = {...DEFAULTS, ...savedGroup};
+      for (const target of TARGETS) state.project.parameters_by_group[group][target] = {...defaultParams(target), ...savedGroup};
     }
   }
   for (const view of state.project.views) {
@@ -346,24 +355,38 @@ function drawOverlay(target=$("overlayCanvas"), existingMask=null) {
 }
 
 const fieldMap = {
+  analysisMode:"analysis_mode",
   thresholdMode:"threshold_mode", thresholdLow:"threshold_low", thresholdHigh:"threshold_high",
   minArea:"min_area_px", maxArea:"max_area_px", minCircularity:"min_circularity",
   maxCircularity:"max_circularity", gaussianSigma:"gaussian_sigma",
   watershedDistance:"watershed_min_distance",
+  signalThreshold:"signal_threshold", positiveFraction:"positive_fraction", ringRadius:"ring_radius_px",
 };
 function populateParameters(params) {
   Object.entries(fieldMap).forEach(([id,key]) => $(id).value = params[key]);
+  $("analysisMode").disabled = state.target === "dapi";
+  if (state.target === "dapi") $("analysisMode").value = "particles";
+  updateParameterVisibility();
   updateAreaNote();
 }
 function collectParameters() {
   const params = {...state.project.parameters_by_group[state.currentGroup][state.target]};
-  Object.entries(fieldMap).forEach(([id,key]) => params[key] = id === "thresholdMode" ? $(id).value : Number($(id).value));
+  Object.entries(fieldMap).forEach(([id,key]) => {
+    params[key] = id === "thresholdMode" || id === "analysisMode" ? $(id).value : Number($(id).value);
+  });
   return params;
+}
+function updateParameterVisibility() {
+  const guided = $("analysisMode").value === "nucleus_guided" && state.target !== "dapi";
+  document.querySelectorAll(".particle-only").forEach(node=>node.classList.toggle("hidden",guided));
+  document.querySelectorAll(".guided-only").forEach(node=>node.classList.toggle("hidden",!guided));
+  $("targetParameterTitle").textContent=`${targetLabel(state.target)} ${guided ? "核引导阳性参数" : "独立计数参数"}`;
 }
 function saveParameters(all=false) {
   if (!state.currentGroup) return;
   const params = collectParameters();
   if (params.threshold_low > params.threshold_high) return toast("阈值下限不能大于上限", true);
+  if (params.positive_fraction < 0 || params.positive_fraction > 1) return toast("阳性像素比例必须在 0–1 之间", true);
   state.project.parameters_by_group[state.currentGroup][state.target] = params;
   if (all) state.project.groups.forEach(group => state.project.parameters_by_group[group][state.target] = {...params});
   toast(all ? `${targetLabel(state.target)} 参数已应用到全部实验组` : `已保存“${state.currentGroup}”的 ${targetLabel(state.target)} 参数`);
@@ -400,11 +423,20 @@ function analyzeOne(view, params, target) {
     };
     try {
       const channelBuffer = await view.files[target].arrayBuffer();
+      const guided = target !== "dapi" && params.analysis_mode === "nucleus_guided";
+      const anchorDetections = guided && targetStatus(view.id,"dapi") === "done"
+        ? (targetResult(view.id,"dapi").detections || []).filter(item=>!item.deleted)
+        : null;
+      const anchorBuffer = guided && !anchorDetections ? await view.files.dapi.arrayBuffer() : null;
+      const transfers = anchorBuffer ? [channelBuffer,anchorBuffer] : [channelBuffer];
       worker.postMessage({
         type:"analyze", params, target, targetLabel:targetLabel(target),
         pixelSizeUm:state.project.pixel_size_um,
         channelBuffer, channelExtension:extension(view.files[target].name),
-      },[channelBuffer]);
+        anchorBuffer, anchorExtension:guided ? extension(view.files.dapi.name) : null,
+        anchorParams:guided ? state.project.parameters_by_group[view.group].dapi : null,
+        anchorDetections,
+      },transfers);
     } catch (error) {
       state.cancelReject = null;
       reject(error);
@@ -650,6 +682,7 @@ function refreshChannelLabels() {
   $("currentTargetName").textContent=targetLabel(state.target);
   if (state.currentGroup) $("profileGroup").textContent=`${state.currentGroup} · ${targetLabel(state.target)}`;
   $("calibrationWarning").textContent=`推荐顺序：选择 ${targetLabel("dapi")} → 随机预跑 → 保存阈值 → 批量；然后对 ${targetLabel("nk")}、${targetLabel("tumor")} 分别重复。三类参数互不覆盖。`;
+  if (state.currentGroup) updateParameterVisibility();
 }
 function saveChannelNames() {
   if (!state.project) return;
@@ -738,5 +771,6 @@ document.querySelectorAll(".legend button[data-class]").forEach(button=>button.o
 });
 $("zoomInBtn").onclick=()=>setZoom(state.zoom+.25);$("zoomOutBtn").onclick=()=>setZoom(state.zoom-.25);$("fitBtn").onclick=()=>setZoom(1);
 $("minArea").addEventListener("input",updateAreaNote);
+$("analysisMode").addEventListener("change",updateParameterVisibility);
 $("viewer").addEventListener("wheel",event=>{event.preventDefault();setZoom(state.zoom+(event.deltaY<0?.15:-.15));},{passive:false});
 window.addEventListener("resize",()=>state.currentViewId&&viewById(state.currentViewId).width&&fitStage(viewById(state.currentViewId).width,viewById(state.currentViewId).height));

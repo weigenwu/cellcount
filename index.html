@@ -152,17 +152,23 @@
       <details open>
         <summary><span id="targetDot" class="dot blue"></span><span id="targetParameterTitle">DAPI 独立计数参数</span></summary>
         <div class="fields">
-          <label class="full">阈值模式<select id="thresholdMode"><option value="manual">手动范围</option><option value="auto">Otsu 自动</option></select></label>
-          <label>下限<input id="thresholdLow" type="number" min="0" max="255"></label>
-          <label>上限<input id="thresholdHigh" type="number" min="0" max="255"></label>
-          <label>最小面积 <small>px²</small><input id="minArea" type="number" min="1"></label>
-          <label>最大面积 <small>px²</small><input id="maxArea" type="number" min="1"></label>
-          <label>最小圆度<input id="minCircularity" type="number" min="0" max="1" step="0.01"></label>
-          <label>最大圆度<input id="maxCircularity" type="number" min="0" max="1" step="0.01"></label>
-          <label>平滑半径<input id="gaussianSigma" type="number" min="0" max="5" step="1"></label>
-          <label>分水岭距离<input id="watershedDistance" type="number" min="1"></label>
+          <label class="full">计数方式<select id="analysisMode"><option value="particles">独立颗粒切割</option><option value="nucleus_guided">按第一通道细胞核判定阳性</option></select></label>
+          <label class="full particle-only">阈值模式<select id="thresholdMode"><option value="manual">手动范围</option><option value="auto">Otsu 自动</option></select></label>
+          <label class="particle-only">下限<input id="thresholdLow" type="number" min="0" max="255"></label>
+          <label class="particle-only">上限<input id="thresholdHigh" type="number" min="0" max="255"></label>
+          <label class="particle-only">最小面积 <small>px²</small><input id="minArea" type="number" min="1"></label>
+          <label class="particle-only">最大面积 <small>px²</small><input id="maxArea" type="number" min="1"></label>
+          <label class="particle-only">最小圆度<input id="minCircularity" type="number" min="0" max="1" step="0.01"></label>
+          <label class="particle-only">最大圆度<input id="maxCircularity" type="number" min="0" max="1" step="0.01"></label>
+          <label class="particle-only">平滑半径<input id="gaussianSigma" type="number" min="0" max="5" step="1"></label>
+          <label class="particle-only">分水岭抑制 <small>越大切得越少</small><input id="watershedDistance" type="number" min="1"></label>
+          <label class="guided-only hidden">信号阈值 <small>背景校正后</small><input id="signalThreshold" type="number" min="0" max="255"></label>
+          <label class="guided-only hidden">阳性像素比例<input id="positiveFraction" type="number" min="0" max="1" step="0.01"></label>
+          <label class="guided-only hidden">核周半径 <small>px</small><input id="ringRadius" type="number" min="0" max="100"></label>
         </div>
-        <p id="areaConversion" class="parameter-note">400 px² ≈ 19.0 µm²</p>
+        <p id="areaConversion" class="parameter-note particle-only">400 px² ≈ 19.0 µm²</p>
+        <p class="parameter-note particle-only">核被切碎时调高；粘连核未拆开时调低。建议先在 8–16 之间微调。</p>
+        <p class="parameter-note guided-only hidden">先用第一通道分核，再统计核及核周的背景校正信号；降低阈值或阳性比例会计入更多细胞。若第一通道已计数，会复用其结果和人工修正。</p>
       </details>
 
       <button class="button sample-button" id="randomSampleBtn">随机抽取当前组一张预跑</button>
