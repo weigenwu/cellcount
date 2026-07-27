@@ -7,6 +7,18 @@ const DEFAULTS = {
 };
 const TARGETS = ["dapi", "nk", "tumor"];
 const DEFAULT_CHANNEL_LABELS = {dapi:"DAPI", nk:"NK", tumor:"肿瘤"};
+const DEFAULT_CIC_PARAMS = {
+  min_enclosure_coverage:0.75,
+  ring_width_px:36,
+  min_ring_contrast:0.05,
+  max_candidates:200,
+  red_quantile:0.72,
+  sector_positive_fraction:0.18,
+  homotypic_enabled:true,
+  homotypic_min_coverage:0.88,
+  homotypic_host_max_circularity:0.78,
+  host_max_distance_px:150,
+};
 function defaultParams(target) {
   return {
     ...DEFAULTS,
@@ -17,8 +29,9 @@ function defaultParams(target) {
   };
 }
 const state = {
-  project: null, currentViewId: null, currentGroup: null, channel: "overlay", target: "dapi",
+  project: null, currentViewId: null, currentGroup: null, channel: "overlay", target: "dapi", layer:"cells",
   detections: [], selectedId: null, mode: "select", zoom: 1, worker: null,
+  cicEvents: [], selectedCicId: null, cicMode:"select",
   cancelled: false, cancelReject: null, pendingProject: null, busy: false,
   inspectionMode: "original", showLabels: true, rawImage: null,
   visibleClasses: new Set(["dapi", "tumor", "nk"]),
@@ -96,13 +109,14 @@ async function scanFolder(fileList) {
   views.sort((a,b) => a.id.localeCompare(b.id, "zh-CN", {numeric:true}));
   const groups = [...new Set(views.map(view => view.group))];
   state.project = {
-    version:1, browserVersion:true, name:root, pixel_size_um:pixelSizeUm, suffixes,
+    version:2, browserVersion:true, name:root, pixel_size_um:pixelSizeUm, suffixes,
     channel_labels:{...DEFAULT_CHANNEL_LABELS},
     groups, views,
     parameters_by_group:Object.fromEntries(groups.map(group => [
       group,
       Object.fromEntries(TARGETS.map(target => [target, defaultParams(target)]))
     ])),
+    cic_parameters_by_group:Object.fromEntries(groups.map(group=>[group,{...DEFAULT_CIC_PARAMS}])),
     results:{}, created_at:new Date().toISOString(),
   };
   state.selectedGroups=new Set(groups);
@@ -133,10 +147,14 @@ function mergePendingProject() {
     } else {
       for (const target of TARGETS) state.project.parameters_by_group[group][target] = {...defaultParams(target), ...savedGroup};
     }
+    state.project.cic_parameters_by_group[group]={
+      ...DEFAULT_CIC_PARAMS,
+      ...(saved.cic_parameters_by_group?.[group]||saved.cic_parameters||{})
+    };
   }
   for (const view of state.project.views) {
     if (saved.results?.[view.id]) {
-    const savedResult = saved.results[view.id];
+      const savedResult = saved.results[view.id];
     if (savedResult.dapi || savedResult.nk || savedResult.tumor) {
         state.project.results[view.id] = {};
         for (const target of TARGETS) {
@@ -146,6 +164,13 @@ function mergePendingProject() {
             detections:(savedResult[target].detections||[]).map(inflateDetection)
           };
         }
+      }
+      if (savedResult.cic) {
+        if (!state.project.results[view.id]) state.project.results[view.id]={};
+        state.project.results[view.id].cic={
+          ...savedResult.cic,
+          events:(savedResult.cic.events||[]).map(event=>({...event}))
+        };
       }
       view.status = overallStatus(view);
     }
@@ -170,6 +195,8 @@ function groupViews(group) { return state.project.views.filter(view => view.grou
 function viewById(id) { return state.project.views.find(view => view.id === id); }
 function targetResult(viewId, target=state.target) { return state.project.results[viewId]?.[target]; }
 function targetStatus(viewId, target) { return targetResult(viewId,target)?.status || "pending"; }
+function cicResult(viewId=state.currentViewId) { return state.project?.results?.[viewId]?.cic; }
+function cicStatus(viewId=state.currentViewId) { return cicResult(viewId)?.status || "pending"; }
 function overallStatus(view) {
   if (view.error) return "error";
   const statuses = TARGETS.map(target => targetStatus(view.id,target));
@@ -210,7 +237,7 @@ function updateSelectedGroupCount() {
 }
 
 async function selectView(id) {
-  state.currentViewId = id; state.selectedId = null;
+  state.currentViewId = id; state.selectedId = null; state.selectedCicId=null;
   const view = viewById(id);
   state.currentGroup = view.group;
   $("currentGroupLabel").textContent = view.group;
@@ -218,6 +245,8 @@ async function selectView(id) {
   $("profileGroup").textContent = `${view.group} · ${targetLabel(state.target)}`;
   populateParameters(state.project.parameters_by_group[view.group][state.target]);
   state.detections = targetResult(id)?.detections || [];
+  state.cicEvents = cicResult(id)?.events || [];
+  populateCicParameters(state.project.cic_parameters_by_group[view.group]);
   updateCounts();
   renderGroups();
   await showImage();
@@ -242,7 +271,7 @@ async function decodeRgba(file) {
 
 async function showImage() {
   const view = viewById(state.currentViewId);
-  const file = view?.files[state.channel] || view?.files.dapi;
+  const file = state.layer==="cic" ? (view?.files.overlay||view?.files.dapi) : (view?.files[state.channel] || view?.files.dapi);
   if (!file) return;
   $("decodeBusy").classList.remove("hidden");
   try {
@@ -337,6 +366,12 @@ function renderInspectionView() {
   if (!imageCanvas.width || !state.rawImage) return;
   const context=imageCanvas.getContext("2d");
   context.clearRect(0,0,imageCanvas.width,imageCanvas.height);
+  if (state.layer==="cic") {
+    state.inspectionMode="original";
+    context.putImageData(new ImageData(state.rawImage.rgba,state.rawImage.width,state.rawImage.height),0,0);
+    drawCicOverlay($("overlayCanvas"));
+    return;
+  }
   const mask=buildAcceptedMask();
   if (state.inspectionMode==="binary") {
     context.fillStyle="#fff";
@@ -346,6 +381,45 @@ function renderInspectionView() {
     context.putImageData(new ImageData(state.rawImage.rgba,state.rawImage.width,state.rawImage.height),0,0);
   }
   drawOverlay($("overlayCanvas"),mask);
+}
+
+function cicDisplayColor(event) {
+  if (event.classification==="heterotypic") return "#32d6ff";
+  if (event.classification==="homotypic") return "#b98cff";
+  return event.type_hint==="homotypic" ? "#ff8f55" : "#ffbd4a";
+}
+function drawCicOverlay(target=$("overlayCanvas")) {
+  if (!target.width) return;
+  const context=target.getContext("2d");
+  context.clearRect(0,0,target.width,target.height);
+  let index=0;
+  for (const event of state.cicEvents) {
+    if (event.deleted || event.classification==="rejected") continue;
+    index++;
+    const color=cicDisplayColor(event);
+    const inner=Math.max(10,event.inner_radius||event.radius||16);
+    const outer=Math.max(inner+10,event.outer_radius||inner+36);
+    context.save();
+    context.strokeStyle=color;
+    context.lineWidth=event.id===state.selectedCicId?5:3;
+    if (event.classification==="pending") context.setLineDash([10,7]);
+    context.beginPath();context.arc(event.x,event.y,inner,0,Math.PI*2);context.stroke();
+    context.globalAlpha=.8;
+    context.beginPath();context.arc(event.x,event.y,outer,0,Math.PI*2);context.stroke();
+    context.setLineDash([]);
+    if (Number.isFinite(event.outer_x)&&Number.isFinite(event.outer_y)) {
+      context.globalAlpha=.65;
+      context.beginPath();context.moveTo(event.x,event.y);context.lineTo(event.outer_x,event.outer_y);context.stroke();
+      context.beginPath();context.arc(event.outer_x,event.outer_y,5,0,Math.PI*2);context.fillStyle=color;context.fill();
+    }
+    context.restore();
+    if (!state.showLabels) continue;
+    const prefix=event.classification==="heterotypic"?"异":event.classification==="homotypic"?"同":event.type_hint==="homotypic"?"同?":"异?";
+    context.font="700 16px system-ui";context.textAlign="center";context.textBaseline="middle";
+    context.lineWidth=4;context.strokeStyle="rgba(0,0,0,.9)";context.fillStyle="#fff";
+    const label=`${prefix}${index}`;
+    context.strokeText(label,event.x,event.y-outer-12);context.fillText(label,event.x,event.y-outer-12);
+  }
 }
 
 function drawOverlay(target=$("overlayCanvas"), existingMask=null) {
@@ -422,6 +496,37 @@ function updateAreaNote() {
   $("areaConversion").textContent = `${area} px² ≈ ${(area*state.project.pixel_size_um**2).toFixed(1)} µm²`;
 }
 
+const cicFieldMap={
+  cicMinCoverage:"min_enclosure_coverage",
+  cicRingWidth:"ring_width_px",
+  cicMinContrast:"min_ring_contrast",
+  cicMaxCandidates:"max_candidates",
+};
+function populateCicParameters(params={}) {
+  const merged={...DEFAULT_CIC_PARAMS,...params};
+  Object.entries(cicFieldMap).forEach(([id,key])=>$(id).value=merged[key]);
+  $("cicHomotypicEnabled").checked=Boolean(merged.homotypic_enabled);
+}
+function collectCicParameters() {
+  const params={...DEFAULT_CIC_PARAMS,...state.project.cic_parameters_by_group[state.currentGroup]};
+  Object.entries(cicFieldMap).forEach(([id,key])=>params[key]=Number($(id).value));
+  params.homotypic_enabled=$("cicHomotypicEnabled").checked;
+  return params;
+}
+function saveCicParameters(all=false) {
+  if (!state.currentGroup) return null;
+  const params=collectCicParameters();
+  if (params.min_enclosure_coverage<0.25||params.min_enclosure_coverage>1) {
+    toast("CIC 最小包围比例必须在 0.25–1 之间",true);return null;
+  }
+  if (params.ring_width_px<8||params.max_candidates<10) {
+    toast("CIC 环宽或最多候选数过小",true);return null;
+  }
+  state.project.cic_parameters_by_group[state.currentGroup]={...params};
+  if (all) state.project.groups.forEach(group=>state.project.cic_parameters_by_group[group]={...params});
+  return params;
+}
+
 function createWorker() {
   if (state.worker) state.worker.terminate();
   state.worker = new Worker("browser-worker.js");
@@ -487,6 +592,8 @@ async function analyzeScope(scope) {
       : "";
     if (!confirm(`当前正在重新分析 ${label}。所选范围包含 ${label} 自身的人工修正，继续只会清除这些 ${label} 修正；其他通道不受影响。是否继续？${guidance}`)) return;
   }
+  const hasCicResults=views.some(view=>cicStatus(view.id)!=="pending");
+  if(hasCicResults&&!confirm(`所选范围已有 CIC 候选或人工确认。重新分析 ${label} 后细胞坐标可能变化，因此只会将这些视野的 CIC 结果重置为“未分析”；三类细胞的其他结果不受影响。是否继续？`))return;
   state.cancelled = false;
   state.busy = true;
   $("jobPanel").classList.remove("hidden");
@@ -509,6 +616,7 @@ async function analyzeScope(scope) {
         status:"done",error:"",detections:result.detections,
         parameter_group:view.group,parameters:{...state.project.parameters_by_group[view.group][target]}
       };
+      if(hasCicResults)state.project.results[view.id].cic={status:"pending",error:"",events:[]};
     } catch (error) {
       if (state.cancelled) {
         state.project.results[view.id][target] = previous || {status:"pending",error:"",detections:[]};
@@ -534,6 +642,89 @@ async function analyzeScope(scope) {
   toast(state.cancelled ? `${targetLabel(target)} 批处理已停止，已完成结果仍保留` : `${targetLabel(target)} 分析完成`);
 }
 
+function compactDetections(detections=[]) {
+  return detections.filter(item=>!item.deleted).map(item=>({
+    id:item.id,x:item.x,y:item.y,radius:item.radius||12,area_px:item.area_px||0,
+    circularity:Number.isFinite(item.circularity)?item.circularity:1,manual:Boolean(item.manual)
+  }));
+}
+function analyzeCicOne(view,params) {
+  return new Promise(async(resolve,reject)=>{
+    state.cancelReject=()=>reject(new Error("__cancelled__"));
+    const worker=createWorker();
+    worker.onmessage=event=>{
+      if(event.data.type==="progress") $("jobCurrent").textContent=`${view.group} / ${view.name} · ${event.data.phase}`;
+      else if(event.data.type==="result"){state.cancelReject=null;resolve(event.data);}
+      else if(event.data.type==="error"){state.cancelReject=null;reject(new Error(event.data.error));}
+    };
+    worker.onerror=event=>{state.cancelReject=null;reject(new Error(event.message||"CIC 分析线程失败"));};
+    try {
+      const redBuffer=await view.files.tumor.arrayBuffer();
+      worker.postMessage({
+        type:"analyze_cic",params,
+        redBuffer,redExtension:extension(view.files.tumor.name),
+        nkDetections:compactDetections(targetResult(view.id,"nk")?.detections),
+        tumorDetections:compactDetections(targetResult(view.id,"tumor")?.detections),
+        pixelSizeUm:state.project.pixel_size_um,
+      },[redBuffer]);
+    } catch(error){state.cancelReject=null;reject(error);}
+  });
+}
+function cicPrerequisitesReady(view) {
+  return TARGETS.every(target=>targetStatus(view.id,target)==="done");
+}
+async function analyzeCicScope(scope) {
+  if (!state.project||state.busy) return;
+  const params=saveCicParameters(false);
+  if (!params) return;
+  let views=scope==="current"?[viewById(state.currentViewId)]:
+    scope==="group"?groupViews(state.currentGroup):
+    state.project.views.filter(view=>state.selectedGroups.has(view.group));
+  views=views.filter(view=>!view.error);
+  const missing=views.filter(view=>!cicPrerequisitesReady(view));
+  views=views.filter(cicPrerequisitesReady);
+  if (!views.length) return toast("请先完成所选视野的 DAPI、NK 和肿瘤三类计数，再筛查 CIC",true);
+  if (views.some(view=>(cicResult(view.id)?.events||[]).some(event=>event.manual||event.reviewed))) {
+    if(!confirm("重新筛查只会清除所选视野的 CIC 候选及 CIC 人工确认；原有 DAPI、NK、肿瘤计数和人工修正不会改变。是否继续？")) return;
+  }
+  state.busy=true;state.cancelled=false;
+  $("jobPanel").classList.remove("hidden");
+  const started=performance.now();
+  for(let index=0;index<views.length;index++){
+    if(state.cancelled) break;
+    const view=views[index];
+    if(!state.project.results[view.id])state.project.results[view.id]={};
+    const previous=state.project.results[view.id].cic;
+    state.project.results[view.id].cic={...(previous||{}),status:"running",error:""};
+    $("jobTitle").textContent=`正在筛查 CIC ${index+1}/${views.length}`;
+    const percent=Math.round(index/views.length*100);
+    $("jobPercent").textContent=`${percent}%`;$("jobProgress").style.width=`${percent}%`;
+    renderResults();updateCounts();
+    try{
+      const result=await analyzeCicOne(view,state.project.cic_parameters_by_group[view.group]);
+      if(state.cancelled)break;
+      state.project.results[view.id].cic={
+        status:"done",error:"",events:result.events,
+        parameters:{...state.project.cic_parameters_by_group[view.group]},
+        method:"2d_candidate_screening_requires_manual_confirmation",
+      };
+    }catch(error){
+      if(state.cancelled){state.project.results[view.id].cic=previous||{status:"pending",error:"",events:[]};break;}
+      state.project.results[view.id].cic={status:"error",error:error.message,events:[]};
+    }
+    const elapsed=(performance.now()-started)/1000,remaining=elapsed/(index+1)*(views.length-index-1);
+    $("jobCurrent").textContent=`${view.group} / ${view.name} · 剩余约 ${formatSeconds(remaining)}`;
+    renderResults();updateCounts();
+  }
+  if(state.worker)state.worker.terminate();
+  state.worker=null;state.cancelReject=null;state.busy=false;
+  $("jobPanel").classList.add("hidden");
+  state.cicEvents=cicResult()?.events||[];
+  if(state.layer==="cic")renderInspectionView();
+  const skipped=missing.length?`；另有 ${missing.length} 个视野因三类计数未完成而跳过`:"";
+  toast(state.cancelled?`CIC 筛查已停止${skipped}`:`CIC 候选筛查完成${skipped}`);
+}
+
 function countTargetDetections(detections=[]) {
   const active=detections.filter(item=>!item.deleted);
   return {total:active.length,corrected:detections.filter(item=>item.manual||item.deleted).length};
@@ -544,11 +735,28 @@ function viewCounts(viewId) {
     countTargetDetections(targetResult(viewId,target)?.detections||[])
   ]));
 }
+function cicCounts(viewId) {
+  const events=cicResult(viewId)?.events||[];
+  const active=events.filter(event=>!event.deleted);
+  return {
+    heterotypic:active.filter(event=>event.classification==="heterotypic").length,
+    homotypic:active.filter(event=>event.classification==="homotypic").length,
+    pending:active.filter(event=>event.classification==="pending").length,
+    rejected:active.filter(event=>event.classification==="rejected").length,
+    corrected:events.filter(event=>event.manual||event.reviewed||event.deleted).length,
+  };
+}
 function updateCounts() {
   const counts=state.currentViewId?viewCounts(state.currentViewId):{};
   $("countDapi").textContent=targetStatus(state.currentViewId,"dapi")==="done"?counts.dapi.total:"—";
   $("countTumor").textContent=targetStatus(state.currentViewId,"tumor")==="done"?counts.tumor.total:"—";
   $("countNk").textContent=targetStatus(state.currentViewId,"nk")==="done"?counts.nk.total:"—";
+  const cic=state.currentViewId?cicCounts(state.currentViewId):{};
+  $("countCicHeterotypic").textContent=cicStatus()==="done"?cic.heterotypic:"—";
+  $("countCicHomotypic").textContent=cicStatus()==="done"?cic.homotypic:"—";
+  $("countCicPending").textContent=cicStatus()==="done"?cic.pending:"—";
+  const cicStatusLabels={pending:"未分析",running:"分析中",done:"已筛查",error:"错误"};
+  $("countCicStatus").textContent=cicStatusLabels[cicStatus()]||cicStatus();
   $("currentTargetName").textContent=targetLabel(state.target);
   updateActionLabels();
 }
@@ -565,9 +773,11 @@ function renderResults() {
   const short={pending:"—",running:"…",done:"✓",error:"!"};
   $("resultsBody").innerHTML=state.project.views.map(view=>{
     const c=viewCounts(view.id);
+    const cic=cicCounts(view.id);
     const corrected=c.dapi.corrected+c.nk.corrected+c.tumor.corrected;
-    const status=TARGETS.map(target=>`${targetLabel(target)} ${short[targetStatus(view.id,target)]}`).join(" · ");
-    return `<tr><td>${escapeHtml(view.group)} / ${escapeHtml(view.name)}</td><td>${targetStatus(view.id,"dapi")==="done"?c.dapi.total:"—"}</td><td>${targetStatus(view.id,"nk")==="done"?c.nk.total:"—"}</td><td>${targetStatus(view.id,"tumor")==="done"?c.tumor.total:"—"}</td><td>${corrected}</td><td class="status-${overallStatus(view)}" title="${escapeHtml(view.error||"")}">${escapeHtml(status)}</td></tr>`;
+    const status=[...TARGETS.map(target=>`${targetLabel(target)} ${short[targetStatus(view.id,target)]}`),`CIC ${short[cicStatus(view.id)]}`].join(" · ");
+    const cicDone=cicStatus(view.id)==="done";
+    return `<tr><td>${escapeHtml(view.group)} / ${escapeHtml(view.name)}</td><td>${targetStatus(view.id,"dapi")==="done"?c.dapi.total:"—"}</td><td>${targetStatus(view.id,"nk")==="done"?c.nk.total:"—"}</td><td>${targetStatus(view.id,"tumor")==="done"?c.tumor.total:"—"}</td><td>${cicDone?cic.heterotypic:"—"}</td><td>${cicDone?cic.homotypic:"—"}</td><td>${cicDone?cic.pending:"—"}</td><td>${corrected+cic.corrected}</td><td class="status-${overallStatus(view)}" title="${escapeHtml(view.error||cicResult(view.id)?.error||"")}">${escapeHtml(status)}</td></tr>`;
   }).join("");
 }
 
@@ -593,7 +803,71 @@ function detectionAtPoint(point) {
   });
   return best;
 }
+function cicEventAtPoint(point) {
+  let best=null,distance=Infinity;
+  for(const event of state.cicEvents){
+    if(event.deleted||event.classification==="rejected")continue;
+    const d=Math.hypot(event.x-point.x,event.y-point.y);
+    if(d<=Math.max(24,event.outer_radius||48)&&d<distance){best=event;distance=d;}
+  }
+  return best;
+}
+function syncCicCorrections(message="CIC 修正已保存") {
+  if(!state.project.results[state.currentViewId])state.project.results[state.currentViewId]={};
+  state.project.results[state.currentViewId].cic={
+    ...(cicResult()||{}),status:"done",error:"",events:state.cicEvents
+  };
+  state.selectedCicId=null;
+  updateCounts();renderInspectionView();renderResults();
+  $("cicSelectionHint").textContent=message;
+}
+function handleCicCanvasClick(event) {
+  if(state.mode==="pan")return;
+  if(cicStatus()!=="done"&&state.mode!=="cic-add")return toast("请先筛查当前视野 CIC 候选",true);
+  const point=canvasPoint(event);
+  if(state.mode==="cic-add"){
+    const id=`cic-manual-${Date.now()}`;
+    state.cicEvents.push({
+      id,x:point.x,y:point.y,inner_radius:18,outer_radius:54,
+      classification:"pending",type_hint:"heterotypic",confidence:null,
+      source:"manual",manual:true,reviewed:false,deleted:false,
+    });
+    state.selectedCicId=id;
+    if(!state.project.results[state.currentViewId])state.project.results[state.currentViewId]={};
+    state.project.results[state.currentViewId].cic={
+      ...(cicResult()||{}),status:"done",error:"",events:state.cicEvents
+    };
+    updateCounts();renderInspectionView();renderResults();
+    $("cicSelectionHint").textContent="已添加 CIC，请确认异质、同质或排除";
+    return;
+  }
+  const selected=cicEventAtPoint(point);
+  state.selectedCicId=selected?.id||null;
+  $("cicSelectionHint").textContent=selected
+    ? `${selected.id} · 自动提示 ${selected.type_hint==="homotypic"?"同质":"异质"} · 包围比例 ${Number(selected.enclosure_coverage||0).toFixed(2)}`
+    :"未选中 CIC 候选";
+  drawCicOverlay();
+}
+function classifySelectedCic(classification) {
+  const event=state.cicEvents.find(item=>item.id===state.selectedCicId);
+  if(!event)return toast("请先选择一个 CIC 候选",true);
+  event.classification=classification;event.reviewed=true;event.manual=true;
+  syncCicCorrections(classification==="heterotypic"?`已确认异质 CIC：${event.id}`:`已确认同质 CIC：${event.id}`);
+}
+function rejectSelectedCic() {
+  const event=state.cicEvents.find(item=>item.id===state.selectedCicId);
+  if(!event)return toast("请先选择一个 CIC 候选",true);
+  event.classification="rejected";event.reviewed=true;event.manual=true;
+  syncCicCorrections(`已排除候选：${event.id}`);
+}
+function deleteSelectedCic() {
+  const event=state.cicEvents.find(item=>item.id===state.selectedCicId);
+  if(!event)return toast("请先选择一个 CIC 候选",true);
+  event.deleted=true;event.reviewed=true;event.manual=true;
+  syncCicCorrections(`已删除 CIC 标记：${event.id}`);
+}
 function handleCanvasClick(event) {
+  if(state.layer==="cic")return handleCicCanvasClick(event);
   if (state.mode==="pan") return;
   if (!targetResult(state.currentViewId)?.detections) return toast(`请先预跑当前视野的 ${targetLabel(state.target)}`);
   const point=canvasPoint(event);
@@ -639,12 +913,19 @@ function serializableProject() {
         detections:(viewResult[target].detections||[]).map(deflateDetection)
       };
     }
+    if(viewResult.cic){
+      serializedResults[viewId].cic={
+        ...viewResult.cic,
+        events:(viewResult.cic.events||[]).map(event=>({...event}))
+      };
+    }
   }
   return {
-    version:1,browserVersion:true,name:state.project.name,pixel_size_um:state.project.pixel_size_um,
+    version:2,browserVersion:true,name:state.project.name,pixel_size_um:state.project.pixel_size_um,
     suffixes:state.project.suffixes,channel_labels:state.project.channel_labels,
     selected_groups:[...state.selectedGroups],
     groups:state.project.groups,parameters_by_group:state.project.parameters_by_group,
+    cic_parameters_by_group:state.project.cic_parameters_by_group,
     views:state.project.views.map(({id,group,name,width,height,status,error,fileNames})=>({id,group,name,width,height,status,error,fileNames})),
     results:serializedResults,updated_at:new Date().toISOString(),
   };
@@ -735,32 +1016,187 @@ async function annotatedBlob(view,target) {
   canvas.width=1;canvas.height=1;mask.width=1;mask.height=1;
   return blob;
 }
+async function cicAnnotatedBlob(view) {
+  const decoded=await decodeRgba(view.files.overlay||view.files.dapi);
+  const canvas=document.createElement("canvas");
+  canvas.width=decoded.width;canvas.height=decoded.height;
+  const context=canvas.getContext("2d");
+  context.putImageData(new ImageData(decoded.rgba,decoded.width,decoded.height),0,0);
+  const events=(cicResult(view.id)?.events||[]).filter(event=>!event.deleted&&event.classification!=="rejected");
+  events.forEach((event,index)=>{
+    const color=cicDisplayColor(event);
+    const inner=Math.max(10,event.inner_radius||16),outer=Math.max(inner+10,event.outer_radius||inner+36);
+    context.save();context.strokeStyle=color;context.lineWidth=4;
+    if(event.classification==="pending")context.setLineDash([12,8]);
+    context.beginPath();context.arc(event.x,event.y,inner,0,Math.PI*2);context.stroke();
+    context.globalAlpha=.8;context.beginPath();context.arc(event.x,event.y,outer,0,Math.PI*2);context.stroke();
+    context.restore();
+    const prefix=event.classification==="heterotypic"?"异":event.classification==="homotypic"?"同":"待";
+    context.font="700 18px system-ui";context.textAlign="center";context.textBaseline="middle";
+    context.lineWidth=4;context.strokeStyle="rgba(0,0,0,.9)";context.fillStyle="#fff";
+    context.strokeText(`${prefix}${index+1}`,event.x,event.y-outer-13);
+    context.fillText(`${prefix}${index+1}`,event.x,event.y-outer-13);
+  });
+  const counts=cicCounts(view.id);
+  const title=`${view.group} / ${view.name} · 异质 ${counts.heterotypic} · 同质 ${counts.homotypic} · 待复核 ${counts.pending}`;
+  context.font="700 22px system-ui";context.textAlign="left";context.textBaseline="top";
+  const titleWidth=Math.min(decoded.width-24,context.measureText(title).width+28);
+  context.fillStyle="rgba(0,0,0,.75)";context.fillRect(12,12,titleWidth,44);
+  context.fillStyle="#fff";context.fillText(title,26,23,decoded.width-52);
+  const blob=await canvasBlob(canvas);canvas.width=1;canvas.height=1;return blob;
+}
 function csvText(views=state.project.views) {
   const headers=[
     "实验组","视野",
     ...TARGETS.map(target=>`${targetLabel(target)}总数`),
+    "异质CIC","同质CIC","待复核CIC","排除CIC",
     ...TARGETS.map(target=>`${targetLabel(target)}修正数`),
+    "CIC人工修正数",
     ...TARGETS.map(target=>`${targetLabel(target)}状态`),
+    "CIC状态",
     "错误"
   ];
   const rows=views.map(view=>{
     const c=viewCounts(view.id);
+    const cic=cicCounts(view.id);
     return [
       view.group,view.name,
       targetStatus(view.id,"dapi")==="done"?c.dapi.total:"",
       targetStatus(view.id,"nk")==="done"?c.nk.total:"",
       targetStatus(view.id,"tumor")==="done"?c.tumor.total:"",
+      cicStatus(view.id)==="done"?cic.heterotypic:"",
+      cicStatus(view.id)==="done"?cic.homotypic:"",
+      cicStatus(view.id)==="done"?cic.pending:"",
+      cicStatus(view.id)==="done"?cic.rejected:"",
       c.dapi.corrected,c.nk.corrected,c.tumor.corrected,
+      cic.corrected,
       targetStatus(view.id,"dapi"),targetStatus(view.id,"nk"),targetStatus(view.id,"tumor"),
-      view.error||""
+      cicStatus(view.id),view.error||cicResult(view.id)?.error||""
     ];
   });
   const quote=value=>`"${String(value).replaceAll('"','""')}"`;
   return "\ufeff"+[headers,...rows].map(row=>row.map(quote).join(",")).join("\r\n");
 }
+function csvEncode(rows) {
+  const quote=value=>`"${String(value??"").replaceAll('"','""')}"`;
+  return "\ufeff"+rows.map(row=>row.map(quote).join(",")).join("\r\n");
+}
+function cellRawCsv(views=state.project.views) {
+  const rows=[["实验组","视野","通道","对象编号","分类","X_px","Y_px","面积_px2","面积_um2","圆度","阳性像素比例","人工添加或修改","由人工核锚定","已删除"]];
+  for(const view of views){
+    for(const target of TARGETS){
+      for(const item of targetResult(view.id,target)?.detections||[]){
+        rows.push([
+          view.group,view.name,targetLabel(target),item.id,item.classification,
+          Number(item.x).toFixed(2),Number(item.y).toFixed(2),
+          item.area_px??"",item.area_um2==null?"":Number(item.area_um2).toFixed(4),
+          item.circularity==null?"":Number(item.circularity).toFixed(4),
+          item.positive_fraction==null?"":Number(item.positive_fraction).toFixed(4),
+          Boolean(item.manual),Boolean(item.anchor_manual),Boolean(item.deleted)
+        ]);
+      }
+    }
+  }
+  return csvEncode(rows);
+}
+function cicRawCsv(views=state.project.views) {
+  const rows=[["实验组","视野","CIC编号","最终分类","自动提示","内部细胞类型","外部细胞类型","内部细胞编号","外部细胞编号","X_px","Y_px","包围比例","环内差异","置信分","来源","已人工复核","人工修正","已删除"]];
+  for(const view of views){
+    for(const event of cicResult(view.id)?.events||[]){
+      const innerType=TARGETS.includes(event.inner_cell_type)?targetLabel(event.inner_cell_type):event.inner_cell_type;
+      const outerType=TARGETS.includes(event.outer_cell_type)?targetLabel(event.outer_cell_type):event.outer_cell_type;
+      rows.push([
+        view.group,view.name,event.id,event.classification,event.type_hint,
+        innerType,outerType,event.inner_cell_id,event.outer_cell_id,
+        Number(event.x).toFixed(2),Number(event.y).toFixed(2),
+        event.enclosure_coverage==null?"":Number(event.enclosure_coverage).toFixed(4),
+        event.ring_contrast==null?"":Number(event.ring_contrast).toFixed(4),
+        event.confidence==null?"":Number(event.confidence).toFixed(4),
+        event.source,Boolean(event.reviewed),Boolean(event.manual),Boolean(event.deleted)
+      ]);
+    }
+  }
+  return csvEncode(rows);
+}
+function meanSd(values) {
+  if(!values.length)return{mean:0,sd:0};
+  const mean=values.reduce((sum,value)=>sum+value,0)/values.length;
+  const sd=values.length>1?Math.sqrt(values.reduce((sum,value)=>sum+(value-mean)**2,0)/(values.length-1)):0;
+  return{mean,sd};
+}
+function cicGroupStats(views=state.project.views) {
+  return state.project.groups.filter(group=>views.some(view=>view.group===group)).map(group=>{
+    const groupDone=views.filter(view=>view.group===group&&cicStatus(view.id)==="done");
+    const hetero=groupDone.map(view=>cicCounts(view.id).heterotypic);
+    const homo=groupDone.map(view=>cicCounts(view.id).homotypic);
+    const pending=groupDone.map(view=>cicCounts(view.id).pending);
+    const hs=meanSd(hetero),os=meanSd(homo);
+    return{
+      group,n:groupDone.length,
+      heterotypic_total:hetero.reduce((a,b)=>a+b,0),homotypic_total:homo.reduce((a,b)=>a+b,0),
+      pending_total:pending.reduce((a,b)=>a+b,0),
+      heterotypic_mean:hs.mean,heterotypic_sd:hs.sd,
+      homotypic_mean:os.mean,homotypic_sd:os.sd,
+    };
+  });
+}
+function cicSummaryCsv(views=state.project.views) {
+  const rows=[["实验组","已完成视野数","异质CIC总数","异质CIC每视野均值","异质CIC标准差","同质CIC总数","同质CIC每视野均值","同质CIC标准差","待复核总数"]];
+  for(const item of cicGroupStats(views))rows.push([
+    item.group,item.n,item.heterotypic_total,item.heterotypic_mean.toFixed(4),item.heterotypic_sd.toFixed(4),
+    item.homotypic_total,item.homotypic_mean.toFixed(4),item.homotypic_sd.toFixed(4),item.pending_total
+  ]);
+  return csvEncode(rows);
+}
+function xmlEscape(value){return String(value).replace(/[&<>"']/g,char=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&apos;"}[char]));}
+function cicPlotSvg(views=state.project.views) {
+  const data=cicGroupStats(views),width=1100,height=650,left=90,right=35,top=65,bottom=135;
+  const chartW=width-left-right,chartH=height-top-bottom;
+  const max=Math.max(1,...data.flatMap(item=>[item.heterotypic_mean+item.heterotypic_sd,item.homotypic_mean+item.homotypic_sd]));
+  const niceMax=Math.ceil(max*1.15*2)/2;
+  const groupW=chartW/Math.max(1,data.length),barW=Math.min(58,groupW*.26);
+  const y=value=>top+chartH-value/niceMax*chartH;
+  const parts=[`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`,
+    `<rect width="100%" height="100%" fill="white"/>`,
+    `<text x="${width/2}" y="32" text-anchor="middle" font-family="Microsoft YaHei, Arial, sans-serif" font-size="22" font-weight="700">CIC 每视野计数（均值 ± 标准差）</text>`];
+  for(let tick=0;tick<=5;tick++){
+    const value=niceMax*tick/5,yy=y(value);
+    parts.push(`<line x1="${left}" y1="${yy}" x2="${width-right}" y2="${yy}" stroke="#dfe4ea"/>`);
+    parts.push(`<text x="${left-12}" y="${yy+5}" text-anchor="end" font-family="Microsoft YaHei, Arial, sans-serif" font-size="13" fill="#44505e">${value.toFixed(value<5?1:0)}</text>`);
+  }
+  data.forEach((item,index)=>{
+    const center=left+groupW*(index+.5);
+    [[item.heterotypic_mean,item.heterotypic_sd,"#24bfe8",-barW*.65],[item.homotypic_mean,item.homotypic_sd,"#9b6ee8",barW*.65]].forEach(([mean,sd,color,offset])=>{
+      const x=center+offset-barW/2,yy=y(mean),h=top+chartH-yy,errTop=y(mean+sd),errBottom=y(Math.max(0,mean-sd));
+      parts.push(`<rect x="${x}" y="${yy}" width="${barW}" height="${h}" rx="3" fill="${color}"/>`);
+      parts.push(`<line x1="${x+barW/2}" y1="${errTop}" x2="${x+barW/2}" y2="${errBottom}" stroke="#222" stroke-width="2"/>`);
+      parts.push(`<line x1="${x+barW/2-8}" y1="${errTop}" x2="${x+barW/2+8}" y2="${errTop}" stroke="#222" stroke-width="2"/>`);
+    });
+    parts.push(`<text transform="translate(${center},${top+chartH+22}) rotate(28)" text-anchor="start" font-family="Microsoft YaHei, Arial, sans-serif" font-size="13">${xmlEscape(item.group)} (n=${item.n})</text>`);
+  });
+  parts.push(`<line x1="${left}" y1="${top+chartH}" x2="${width-right}" y2="${top+chartH}" stroke="#222" stroke-width="2"/>`);
+  parts.push(`<text transform="translate(25,${top+chartH/2}) rotate(-90)" text-anchor="middle" font-family="Microsoft YaHei, Arial, sans-serif" font-size="16">确认 CIC 数 / 视野</text>`);
+  parts.push(`<rect x="${width-215}" y="48" width="16" height="16" fill="#24bfe8"/><text x="${width-192}" y="61" font-family="Microsoft YaHei, Arial, sans-serif" font-size="13">异质 CIC</text>`);
+  parts.push(`<rect x="${width-105}" y="48" width="16" height="16" fill="#9b6ee8"/><text x="${width-82}" y="61" font-family="Microsoft YaHei, Arial, sans-serif" font-size="13">同质 CIC</text>`);
+  parts.push(`</svg>`);return parts.join("");
+}
+async function svgToPngBlob(svg,width=1100,height=650) {
+  const blob=new Blob([svg],{type:"image/svg+xml;charset=utf-8"}),url=URL.createObjectURL(blob);
+  try{
+    const image=new Image();
+    await new Promise((resolve,reject)=>{image.onload=resolve;image.onerror=reject;image.src=url;});
+    const canvas=document.createElement("canvas");canvas.width=width;canvas.height=height;
+    canvas.getContext("2d").drawImage(image,0,0,width,height);
+    return await canvasBlob(canvas);
+  }finally{URL.revokeObjectURL(url);}
+}
 function downloadSummaryFiles() {
   downloadBlob(new Blob([csvText()],{type:"text/csv;charset=utf-8"}),`${state.project.name}-cell-count-results.csv`);
   setTimeout(()=>downloadBlob(new Blob([JSON.stringify(serializableProject(),null,2)],{type:"application/json"}),`${state.project.name}-cell-count-project.json`),250);
+  setTimeout(()=>downloadBlob(new Blob([cellRawCsv()],{type:"text/csv;charset=utf-8"}),`${state.project.name}-cell-object-raw-data.csv`),500);
+  setTimeout(()=>downloadBlob(new Blob([cicRawCsv()],{type:"text/csv;charset=utf-8"}),`${state.project.name}-CIC-raw-events.csv`),750);
+  setTimeout(()=>downloadBlob(new Blob([cicSummaryCsv()],{type:"text/csv;charset=utf-8"}),`${state.project.name}-CIC-group-summary.csv`),1000);
+  setTimeout(()=>downloadBlob(new Blob([cicPlotSvg()],{type:"image/svg+xml;charset=utf-8"}),`${state.project.name}-CIC-plot.svg`),1250);
 }
 async function exportResults() {
   if (!state.project || state.busy) return;
@@ -787,6 +1223,12 @@ async function exportResults() {
     const root=await parent.getDirectoryHandle(`${safeFileName(state.project.name)}_cell-count-results`,{create:true});
     const processedViews=state.project.views.filter(view=>processedGroups.includes(view.group));
     await writeLocalFile(root,"全部文件夹汇总.csv",new Blob([csvText(processedViews)],{type:"text/csv;charset=utf-8"}));
+    await writeLocalFile(root,"细胞逐对象原始数据.csv",new Blob([cellRawCsv(processedViews)],{type:"text/csv;charset=utf-8"}));
+    await writeLocalFile(root,"CIC逐事件原始数据.csv",new Blob([cicRawCsv(processedViews)],{type:"text/csv;charset=utf-8"}));
+    await writeLocalFile(root,"CIC组汇总.csv",new Blob([cicSummaryCsv(processedViews)],{type:"text/csv;charset=utf-8"}));
+    const cicSvg=cicPlotSvg(processedViews);
+    await writeLocalFile(root,"CIC组间图.svg",new Blob([cicSvg],{type:"image/svg+xml;charset=utf-8"}));
+    await writeLocalFile(root,"CIC组间图.png",await svgToPngBlob(cicSvg));
     await writeLocalFile(root,"项目.json",new Blob([JSON.stringify(serializableProject(),null,2)],{type:"application/json"}));
     const mirrored=await root.getDirectoryHandle("按原目录排列",{create:true});
     const groupOutputs=new Map();
@@ -794,9 +1236,13 @@ async function exportResults() {
       const groupDir=await nestedDirectory(mirrored,group);
       const groupErrors=[];
       await writeLocalFile(groupDir,"计数结果.csv",new Blob([csvText(groupViews(group))],{type:"text/csv;charset=utf-8"}));
+      await writeLocalFile(groupDir,"细胞逐对象原始数据.csv",new Blob([cellRawCsv(groupViews(group))],{type:"text/csv;charset=utf-8"}));
+      await writeLocalFile(groupDir,"CIC逐事件原始数据.csv",new Blob([cicRawCsv(groupViews(group))],{type:"text/csv;charset=utf-8"}));
+      await writeLocalFile(groupDir,"CIC组汇总.csv",new Blob([cicSummaryCsv(groupViews(group))],{type:"text/csv;charset=utf-8"}));
       groupOutputs.set(group,{
         directory:groupDir,
         annotations:await groupDir.getDirectoryHandle("标注图",{create:true}),
+        cicAnnotations:await groupDir.getDirectoryHandle("CIC标注图",{create:true}),
         errors:groupErrors,
       });
     }
@@ -833,6 +1279,25 @@ async function exportResults() {
       const remaining=elapsed/(index+1)*(tasks.length-index-1);
       $("jobCurrent").textContent+=` · 剩余约 ${formatSeconds(remaining)}`;
     }
+    const cicTasks=processedViews.filter(view=>cicStatus(view.id)==="done");
+    for(let index=0;index<cicTasks.length;index++){
+      if(state.cancelled)break;
+      const view=cicTasks[index],output=groupOutputs.get(view.group);
+      $("jobTitle").textContent=`正在导出 CIC 标注图 ${index+1}/${cicTasks.length}`;
+      const percent=Math.round(index/Math.max(1,cicTasks.length)*100);
+      $("jobPercent").textContent=`${percent}%`;$("jobProgress").style.width=`${percent}%`;
+      $("jobCurrent").textContent=`${view.group} / ${view.name} · CIC`;
+      try{
+        const fileName=`${safeFileName(view.name)}__CIC__标注.png`;
+        await writeLocalFile(output.cicAnnotations,fileName,await cicAnnotatedBlob(view));
+        const c=cicCounts(view.id);
+        manifest.push([view.group,view.name,"CIC",c.heterotypic+c.homotypic,`按原目录排列/${safeRelativePath(view.group)}/CIC标注图/${fileName}`,"done",`待复核 ${c.pending}`]);
+      }catch(error){
+        const message=`${view.group} / ${view.name} / CIC：${error.message}`;
+        errors.push(message);output.errors.push(message);
+        manifest.push([view.group,view.name,"CIC","","","error",error.message]);
+      }
+    }
     const quote=value=>`"${String(value).replaceAll('"','""')}"`;
     const manifestText="\ufeff"+manifest.map(row=>row.map(quote).join(",")).join("\r\n");
     await writeLocalFile(root,"标注图清单.csv",new Blob([manifestText],{type:"text/csv;charset=utf-8"}));
@@ -840,7 +1305,7 @@ async function exportResults() {
     for (const output of groupOutputs.values()) {
       await writeLocalFile(output.directory,"错误报告.txt",new Blob([output.errors.length?output.errors.join("\r\n"):"无错误"],{type:"text/plain;charset=utf-8"}));
     }
-    toast(state.cancelled?"导出已停止；已完成文件保留在所选目录":"计数结果和全部已完成通道标注图已导出");
+    toast(state.cancelled?"导出已停止；已完成文件保留在所选目录":"细胞计数、CIC 原始数据、汇总图和全部标注图已导出");
   } catch(error) {
     toast(`导出失败：${error.message}`,true);
   } finally {
@@ -895,6 +1360,7 @@ function fitCurrentStage() {
   if (width&&height) fitStage(width,height);
 }
 function setReviewMode(mode) {
+  state.layer="cells";
   state.mode=mode;
   for (const name of ["select","add","delete","pan"]) $(`${name}ModeBtn`).classList.toggle("active",name===mode);
   const hints={
@@ -905,6 +1371,59 @@ function setReviewMode(mode) {
   };
   $("selectionHint").textContent=hints[mode];
   updatePanCursor();
+}
+function setCicReviewMode(mode) {
+  state.layer="cic";
+  state.cicMode=mode;
+  state.mode=mode==="pan"?"pan":`cic-${mode}`;
+  for(const name of ["select","add","pan"])$(`cic${name[0].toUpperCase()+name.slice(1)}ModeBtn`).classList.toggle("active",name===mode);
+  const hints={
+    select:"选择候选后确认类型；黄色候选不计入最终结果",
+    add:"点击图片添加一个待确认 CIC 标记",
+    pan:"按住左键拖动图片；滚轮可缩放",
+  };
+  $("cicSelectionHint").textContent=hints[mode];
+  updatePanCursor();
+}
+function showReviewLayer(layer) {
+  state.layer=layer;
+  $("cellReviewBar").classList.toggle("hidden",layer==="cic");
+  $("cicReviewBar").classList.toggle("hidden",layer!=="cic");
+  $("inspectionTabs").classList.toggle("hidden",layer==="cic");
+  if(layer==="cic"){
+    state.channel="overlay";state.cicEvents=cicResult()?.events||[];state.selectedCicId=null;
+    setCicReviewMode(state.cicMode||"select");
+  }else{
+    state.detections=targetResult(state.currentViewId)?.detections||[];
+    if(state.mode.startsWith("cic-")||state.mode==="pan")setReviewMode("select");
+  }
+}
+async function activateCicReview() {
+  if(!state.project)return;
+  showReviewLayer("cic");
+  document.querySelectorAll("#channelTabs button").forEach(button=>button.classList.toggle("active",button.dataset.channel==="cic"));
+  await showImage();updateCounts();
+  $("controlPanel").scrollTo({top:Math.max(0,$("cicPanel").offsetTop-85),behavior:"smooth"});
+}
+async function reviewNextPendingCic() {
+  if(!state.project)return;
+  let start=Math.max(0,state.project.views.findIndex(view=>view.id===state.currentViewId));
+  for(let offset=0;offset<state.project.views.length;offset++){
+    const view=state.project.views[(start+offset)%state.project.views.length];
+    const event=(cicResult(view.id)?.events||[]).find(item=>!item.deleted&&item.classification==="pending");
+    if(!event)continue;
+    if(view.id!==state.currentViewId)await selectView(view.id);
+    if(state.layer!=="cic")await activateCicReview();
+    state.selectedCicId=event.id;drawCicOverlay();
+    const stage=$("imageStage"),viewer=$("viewer");
+    state.zoom=Math.max(state.zoom,2);
+    state.panX=viewer.clientWidth/2-state.fitLeft-event.x*(stage.clientWidth/$("overlayCanvas").width)*state.zoom;
+    state.panY=viewer.clientHeight/2-state.fitTop-event.y*(stage.clientHeight/$("overlayCanvas").height)*state.zoom;
+    applyViewportTransform();
+    $("cicSelectionHint").textContent=`待复核 ${event.id} · 自动提示 ${event.type_hint==="homotypic"?"同质":"异质"}`;
+    return;
+  }
+  toast("当前项目没有待复核 CIC 候选");
 }
 function updatePanCursor() {
   const ready=state.mode==="pan" || state.spacePressed;
@@ -977,7 +1496,9 @@ function saveChannelNames() {
 async function setTarget(target) {
   if (!TARGETS.includes(target) || !state.project) return;
   if (state.busy) return toast("请先等待当前类别分析完成，或点击停止批处理");
+  showReviewLayer("cells");
   state.target=target;
+  $("controlPanel").scrollTo({top:0,behavior:"smooth"});
   state.channel=target;
   document.querySelectorAll("#targetPicker button").forEach(button=>button.classList.toggle("active",button.dataset.target===target));
   document.querySelectorAll("#channelTabs button").forEach(button=>button.classList.toggle("active",button.dataset.channel===target));
@@ -1029,11 +1550,24 @@ $("addModeBtn").onclick=()=>setReviewMode("add");
 $("deleteModeBtn").onclick=()=>setReviewMode("delete");
 $("panModeBtn").onclick=()=>setReviewMode("pan");
 $("deleteDetectionBtn").onclick=deleteSelected;
+$("cicSelectModeBtn").onclick=()=>setCicReviewMode("select");
+$("cicAddModeBtn").onclick=()=>setCicReviewMode("add");
+$("cicPanModeBtn").onclick=()=>setCicReviewMode("pan");
+$("confirmHeterotypicBtn").onclick=()=>classifySelectedCic("heterotypic");
+$("confirmHomotypicBtn").onclick=()=>classifySelectedCic("homotypic");
+$("rejectCicBtn").onclick=rejectSelectedCic;
+$("deleteCicBtn").onclick=deleteSelectedCic;
+$("analyzeCicCurrentBtn").onclick=()=>analyzeCicScope("current");
+$("analyzeCicGroupBtn").onclick=()=>analyzeCicScope("group");
+$("analyzeCicAllBtn").onclick=()=>analyzeCicScope("all");
+$("reviewPendingCicBtn").onclick=reviewNextPendingCic;
 document.querySelectorAll("#channelTabs button").forEach(button=>button.onclick=async()=>{
+  if(button.dataset.channel==="cic"){await activateCicReview();return;}
   if (TARGETS.includes(button.dataset.channel)) {
     await setTarget(button.dataset.channel);
     return;
   }
+  showReviewLayer("cells");
   document.querySelectorAll("#channelTabs button").forEach(item=>item.classList.remove("active"));button.classList.add("active");
   state.channel=button.dataset.channel;showImage();
 });
@@ -1049,7 +1583,7 @@ $("labelsToggle").onclick=()=>{
   state.showLabels=!state.showLabels;
   $("labelsToggle").classList.toggle("active",state.showLabels);
   $("labelsToggle").textContent=state.showLabels?"显示编号":"隐藏编号";
-  drawOverlay();
+  renderInspectionView();
 };
 document.querySelectorAll(".legend button[data-class]").forEach(button=>button.onclick=()=>{
   button.classList.toggle("active");button.classList.contains("active")?state.visibleClasses.add(button.dataset.class):state.visibleClasses.delete(button.dataset.class);renderInspectionView();
@@ -1067,6 +1601,9 @@ $("viewer").addEventListener("pointerup",endPan);
 $("viewer").addEventListener("pointercancel",endPan);
 $("viewer").addEventListener("auxclick",event=>{if(event.button===1)event.preventDefault();});
 window.addEventListener("keydown",event=>{
+  if((event.key==="Delete"||event.key==="Backspace")&&!isTypingTarget(event.target)&&state.layer==="cic"&&state.selectedCicId){
+    event.preventDefault();deleteSelectedCic();return;
+  }
   if((event.key==="Delete" || event.key==="Backspace") && !isTypingTarget(event.target) && state.selectedId){
     event.preventDefault(); deleteSelected(); return;
   }

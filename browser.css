@@ -40,6 +40,20 @@
 .viewer.is-panning canvas { pointer-events: none; }
 .review-mode button.delete { color: #ff8a95; }
 .review-mode button.delete.active { border-color: #ff4a5b; color: #ffb0b7; background: #2a1820; }
+.dot.amber { background: #ffbd4a; }
+.channel-tabs button.cic-tab.active { color: #ffe09a; background: #3a2b17; }
+.cic-actions { flex-wrap: wrap; justify-content: flex-end; }
+.cic-panel { margin-top: 14px; border: 1px solid #4a3921; border-radius: 10px; padding: 11px; background: #111720; }
+.cic-panel summary { color: #ffe0a0; }
+.check-field { display: flex !important; align-items: center; gap: 7px; line-height: 1.4; }
+.check-field input { display: inline-block !important; width: auto !important; margin: 0 !important; }
+.cic-count-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 10px; }
+.cic-count-cards article { border: 1px solid var(--line); border-left: 2px solid #8290a4; border-radius: 7px; padding: 7px; background: #0c1119; }
+.cic-count-cards article.hetero { border-left-color: #32d6ff; }
+.cic-count-cards article.homo { border-left-color: #b98cff; }
+.cic-count-cards article.pending { border-left-color: #ffbd4a; }
+.cic-count-cards span { display: block; color: var(--muted); font-size: 8px; }
+.cic-count-cards strong { display: block; margin-top: 2px; font-size: 16px; }
 @media (max-width: 700px) {
   .welcome { padding: 9vh 22px; }
   .browser-notes { margin-top: 8vh; }

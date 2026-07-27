@@ -72,6 +72,7 @@
           <button data-channel="dapi"><span class="dot blue"></span><span id="viewerLabelDapi">DAPI</span></button>
           <button data-channel="nk"><span class="dot green"></span><span id="viewerLabelNk">NK</span></button>
           <button data-channel="tumor"><span class="dot red"></span><span id="viewerLabelTumor">肿瘤</span></button>
+          <button data-channel="cic" class="cic-tab"><span class="dot amber"></span>CIC 复核</button>
         </div>
         <div class="viewer-actions">
           <div class="inspection-tabs" id="inspectionTabs">
@@ -101,7 +102,7 @@
         </div>
       </div>
 
-      <div class="review-bar">
+      <div id="cellReviewBar" class="review-bar">
         <div class="review-mode">
           <span>人工复核</span>
           <button id="selectModeBtn" class="active">选择标记</button>
@@ -115,6 +116,22 @@
         </div>
       </div>
 
+      <div id="cicReviewBar" class="review-bar hidden">
+        <div class="review-mode">
+          <span>CIC 复核</span>
+          <button id="cicSelectModeBtn" class="active">选择候选</button>
+          <button id="cicAddModeBtn">人工添加 CIC</button>
+          <button id="cicPanModeBtn">拖拽图片</button>
+        </div>
+        <div class="selection-actions cic-actions">
+          <span id="cicSelectionHint">选择候选后确认类型；黄色候选不计入最终结果</span>
+          <button id="confirmHeterotypicBtn" class="class cyan">确认异质</button>
+          <button id="confirmHomotypicBtn" class="class amber">确认同质</button>
+          <button id="rejectCicBtn">排除</button>
+          <button id="deleteCicBtn" class="danger">删除</button>
+        </div>
+      </div>
+
       <div class="results-panel">
         <div class="panel-heading">
           <div><span class="eyebrow">RESULTS</span><h3>批量结果</h3></div>
@@ -125,7 +142,7 @@
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>实验组 / 视野</th><th id="resultHeaderDapi">DAPI</th><th id="resultHeaderNk">NK</th><th id="resultHeaderTumor">肿瘤</th><th>修正</th><th>三类进度</th></tr></thead>
+            <thead><tr><th>实验组 / 视野</th><th id="resultHeaderDapi">DAPI</th><th id="resultHeaderNk">NK</th><th id="resultHeaderTumor">肿瘤</th><th>异质 CIC</th><th>同质 CIC</th><th>待复核</th><th>修正</th><th>处理进度</th></tr></thead>
             <tbody id="resultsBody"></tbody>
           </table>
         </div>
@@ -187,6 +204,29 @@
         <article class="tumor"><span id="countLabelTumor">肿瘤 总数</span><strong id="countTumor">—</strong></article>
         <article class="review"><span>当前计数对象</span><strong id="currentTargetName">DAPI</strong></article>
       </div>
+      <details id="cicPanel" class="cic-panel" open>
+        <summary><span class="dot amber"></span>CIC 候选筛查与复核</summary>
+        <p class="parameter-note">先完成 DAPI、NK、肿瘤计数。自动结果只作为二维候选，必须人工确认后才计入同质或异质 CIC。</p>
+        <div class="fields">
+          <label>最小包围比例<input id="cicMinCoverage" type="number" min="0.25" max="1" step="0.01" value="0.75"></label>
+          <label>红色环宽 <small>px</small><input id="cicRingWidth" type="number" min="8" max="120" value="36"></label>
+          <label>环/内部最小差异<input id="cicMinContrast" type="number" min="-0.5" max="1" step="0.01" value="0.05"></label>
+          <label>单图最多候选<input id="cicMaxCandidates" type="number" min="10" max="1000" value="200"></label>
+          <label class="full check-field"><input id="cicHomotypicEnabled" type="checkbox" checked> 同时筛查同质 CIC 候选（肿瘤–肿瘤，判定更保守）</label>
+        </div>
+        <div class="cic-count-cards">
+          <article class="hetero"><span>异质 CIC</span><strong id="countCicHeterotypic">—</strong></article>
+          <article class="homo"><span>同质 CIC</span><strong id="countCicHomotypic">—</strong></article>
+          <article class="pending"><span>待复核候选</span><strong id="countCicPending">—</strong></article>
+          <article><span>CIC 状态</span><strong id="countCicStatus">未分析</strong></article>
+        </div>
+        <div class="batch-actions">
+          <button class="button primary" id="analyzeCicCurrentBtn">筛查当前图片 CIC</button>
+          <button class="button ghost" id="analyzeCicGroupBtn">批量当前组 CIC</button>
+          <button class="button ghost full" id="analyzeCicAllBtn">批量已选文件夹 CIC</button>
+          <button class="button ghost full" id="reviewPendingCicBtn">跳到下一个待复核候选</button>
+        </div>
+      </details>
       <div class="batch-actions">
         <button class="button primary" id="analyzeCurrentBtn">预跑当前图片</button>
         <button class="button ghost" id="analyzeGroupBtn">批量当前组</button>
