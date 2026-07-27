@@ -40,6 +40,12 @@ const state = {
   spacePressed: false, panning: false, panPointerId: null,
   panStartX: 0, panStartY: 0, panOriginX: 0, panOriginY: 0,
   panMoved: false,
+  undoStack: [], redoStack: [], autosaveTimer: null,
+};
+const compareState = {
+  open:false,
+  left:{viewId:null,channel:"overlay",zoom:1,panX:0,panY:0,fitLeft:0,fitTop:0,raw:null,dragging:false,pointerId:null,startX:0,startY:0,originX:0,originY:0},
+  right:{viewId:null,channel:"overlay",zoom:1,panX:0,panY:0,fitLeft:0,fitTop:0,raw:null,dragging:false,pointerId:null,startX:0,startY:0,originX:0,originY:0},
 };
 const $ = id => document.getElementById(id);
 const colors = {dapi:"#4d7cff", tumor:"#ff4a5b", nk:"#41e090"};
@@ -120,6 +126,7 @@ async function scanFolder(fileList) {
     results:{}, created_at:new Date().toISOString(),
   };
   state.selectedGroups=new Set(groups);
+  if (!state.pendingProject) await restoreAutosave(root);
   mergePendingProject();
   openWorkspace();
   $("folderInput").value = "";
@@ -176,6 +183,7 @@ function mergePendingProject() {
     }
   }
   state.pendingProject = null;
+  updateHistoryButtons();
   toast("已恢复项目参数和计数结果");
 }
 
@@ -226,6 +234,7 @@ function renderGroups() {
     wrapper.querySelector(".group-select input").onchange=event=>{
       event.target.checked?state.selectedGroups.add(group):state.selectedGroups.delete(group);
       updateSelectedGroupCount();
+      scheduleAutosave();
     };
     wrapper.querySelector(".group-toggle").onclick = () => list.classList.toggle("hidden");
     $("groupList").appendChild(wrapper);
@@ -488,6 +497,7 @@ function saveParameters(all=false) {
   if (params.positive_fraction < 0 || params.positive_fraction > 1) return toast("阳性像素比例必须在 0–1 之间", true);
   state.project.parameters_by_group[state.currentGroup][state.target] = params;
   if (all) state.project.groups.forEach(group => state.project.parameters_by_group[group][state.target] = {...params});
+  scheduleAutosave();
   toast(all ? `${targetLabel(state.target)} 参数已应用到全部实验组` : `已保存“${state.currentGroup}”的 ${targetLabel(state.target)} 参数`);
 }
 function updateAreaNote() {
@@ -524,6 +534,7 @@ function saveCicParameters(all=false) {
   }
   state.project.cic_parameters_by_group[state.currentGroup]={...params};
   if (all) state.project.groups.forEach(group=>state.project.cic_parameters_by_group[group]={...params});
+  scheduleAutosave();
   return params;
 }
 
@@ -639,6 +650,7 @@ async function analyzeScope(scope) {
     state.detections=targetResult(state.currentViewId)?.detections||[];
     updateCounts(); renderInspectionView();
   }
+  scheduleAutosave();
   toast(state.cancelled ? `${targetLabel(target)} 批处理已停止，已完成结果仍保留` : `${targetLabel(target)} 分析完成`);
 }
 
@@ -722,6 +734,7 @@ async function analyzeCicScope(scope) {
   state.cicEvents=cicResult()?.events||[];
   if(state.layer==="cic")renderInspectionView();
   const skipped=missing.length?`；另有 ${missing.length} 个视野因三类计数未完成而跳过`:"";
+  scheduleAutosave();
   toast(state.cancelled?`CIC 筛查已停止${skipped}`:`CIC 候选筛查完成${skipped}`);
 }
 
@@ -819,6 +832,7 @@ function syncCicCorrections(message="CIC 修正已保存") {
   };
   state.selectedCicId=null;
   updateCounts();renderInspectionView();renderResults();
+  scheduleAutosave();
   $("cicSelectionHint").textContent=message;
 }
 function handleCicCanvasClick(event) {
@@ -826,6 +840,7 @@ function handleCicCanvasClick(event) {
   if(cicStatus()!=="done"&&state.mode!=="cic-add")return toast("请先筛查当前视野 CIC 候选",true);
   const point=canvasPoint(event);
   if(state.mode==="cic-add"){
+    pushHistory("cic");
     const id=`cic-manual-${Date.now()}`;
     state.cicEvents.push({
       id,x:point.x,y:point.y,inner_radius:18,outer_radius:54,
@@ -851,18 +866,21 @@ function handleCicCanvasClick(event) {
 function classifySelectedCic(classification) {
   const event=state.cicEvents.find(item=>item.id===state.selectedCicId);
   if(!event)return toast("请先选择一个 CIC 候选",true);
+  pushHistory("cic");
   event.classification=classification;event.reviewed=true;event.manual=true;
   syncCicCorrections(classification==="heterotypic"?`已确认异质 CIC：${event.id}`:`已确认同质 CIC：${event.id}`);
 }
 function rejectSelectedCic() {
   const event=state.cicEvents.find(item=>item.id===state.selectedCicId);
   if(!event)return toast("请先选择一个 CIC 候选",true);
+  pushHistory("cic");
   event.classification="rejected";event.reviewed=true;event.manual=true;
   syncCicCorrections(`已排除候选：${event.id}`);
 }
 function deleteSelectedCic() {
   const event=state.cicEvents.find(item=>item.id===state.selectedCicId);
   if(!event)return toast("请先选择一个 CIC 候选",true);
+  pushHistory("cic");
   event.deleted=true;event.reviewed=true;event.manual=true;
   syncCicCorrections(`已删除 CIC 标记：${event.id}`);
 }
@@ -872,12 +890,14 @@ function handleCanvasClick(event) {
   if (!targetResult(state.currentViewId)?.detections) return toast(`请先预跑当前视野的 ${targetLabel(state.target)}`);
   const point=canvasPoint(event);
   if (state.mode==="add") {
+    pushHistory("cell");
     state.detections.push({id:`manual-${Date.now()}`,x:point.x,y:point.y,area_px:452.39,area_um2:452.39*state.project.pixel_size_um**2,radius:12,circularity:1,classification:state.target,manual:true,deleted:false});
     syncCorrections(); return;
   }
   const best=detectionAtPoint(point);
   if (state.mode==="delete") {
     if (!best) { $("selectionHint").textContent="未点中细胞标记"; return; }
+    pushHistory("cell");
     best.deleted=true; best.manual=true;
     syncCorrections();
     $("selectionHint").textContent=`已删除 ${best.id}`;
@@ -890,6 +910,7 @@ function handleCanvasClick(event) {
 function syncCorrections() {
   state.project.results[state.currentViewId][state.target].detections=state.detections;
   state.selectedId=null; updateCounts(); renderInspectionView(); renderResults();
+  scheduleAutosave();
 }
 function reclassify(classification) {
   const item=state.detections.find(d=>d.id===state.selectedId); if(!item)return;
@@ -898,6 +919,7 @@ function reclassify(classification) {
 function deleteSelected() {
   const item=state.detections.find(d=>d.id===state.selectedId);
   if(!item) return toast("请先选择要删除的细胞标记",true);
+  pushHistory("cell");
   item.deleted=true;item.manual=true;syncCorrections();
   $("selectionHint").textContent=`已删除 ${item.id}`;
 }
@@ -929,6 +951,111 @@ function serializableProject() {
     views:state.project.views.map(({id,group,name,width,height,status,error,fileNames})=>({id,group,name,width,height,status,error,fileNames})),
     results:serializedResults,updated_at:new Date().toISOString(),
   };
+}
+function openAutosaveDb() {
+  return new Promise((resolve,reject)=>{
+    const request=indexedDB.open("cellscope-projects",1);
+    request.onupgradeneeded=()=>request.result.createObjectStore("projects",{keyPath:"name"});
+    request.onsuccess=()=>resolve(request.result);
+    request.onerror=()=>reject(request.error);
+  });
+}
+async function restoreAutosave(name) {
+  try {
+    const db=await openAutosaveDb();
+    const saved=await new Promise((resolve,reject)=>{
+      const request=db.transaction("projects","readonly").objectStore("projects").get(name);
+      request.onsuccess=()=>resolve(request.result?.project||null);
+      request.onerror=()=>reject(request.error);
+    });
+    db.close();
+    if(saved){
+      state.pendingProject=saved;
+      $("autosaveStatus").textContent="发现自动保存";
+      $("autosaveStatus").className="autosave-status saved";
+    }
+  } catch(error) {
+    console.warn("自动保存读取失败",error);
+  }
+}
+function scheduleAutosave() {
+  if(!state.project)return;
+  clearTimeout(state.autosaveTimer);
+  $("autosaveStatus").textContent="等待保存";
+  $("autosaveStatus").className="autosave-status saving";
+  state.autosaveTimer=setTimeout(saveAutosave,1200);
+}
+async function saveAutosave() {
+  if(!state.project)return;
+  const name=state.project.name;
+  $("autosaveStatus").textContent="保存中…";
+  $("autosaveStatus").className="autosave-status saving";
+  try{
+    const project=serializableProject();
+    const db=await openAutosaveDb();
+    await new Promise((resolve,reject)=>{
+      const request=db.transaction("projects","readwrite").objectStore("projects").put({
+        name,project,savedAt:new Date().toISOString()
+      });
+      request.onsuccess=()=>resolve();
+      request.onerror=()=>reject(request.error);
+    });
+    db.close();
+    if(state.project?.name===name){
+      $("autosaveStatus").textContent="已自动保存";
+      $("autosaveStatus").className="autosave-status saved";
+    }
+  }catch(error){
+    console.warn("自动保存失败",error);
+    $("autosaveStatus").textContent="自动保存失败";
+    $("autosaveStatus").className="autosave-status";
+  }
+}
+function cloneResult(value) {
+  return value ? structuredClone(value) : null;
+}
+function historySnapshot(kind,viewId=state.currentViewId,target=state.target) {
+  const value=kind==="cic" ? state.project.results[viewId]?.cic : state.project.results[viewId]?.[target];
+  return {kind,viewId,target,value:cloneResult(value)};
+}
+function pushHistory(kind,viewId=state.currentViewId,target=state.target) {
+  state.undoStack.push(historySnapshot(kind,viewId,target));
+  if(state.undoStack.length>60)state.undoStack.shift();
+  state.redoStack=[];
+  updateHistoryButtons();
+}
+function updateHistoryButtons() {
+  if(!$("undoBtn"))return;
+  $("undoBtn").disabled=!state.undoStack.length;
+  $("redoBtn").disabled=!state.redoStack.length;
+}
+async function restoreHistorySnapshot(snapshot) {
+  if(!snapshot||!state.project)return;
+  if(!state.project.results[snapshot.viewId])state.project.results[snapshot.viewId]={};
+  if(snapshot.kind==="cic")state.project.results[snapshot.viewId].cic=cloneResult(snapshot.value);
+  else state.project.results[snapshot.viewId][snapshot.target]=cloneResult(snapshot.value);
+  if(snapshot.viewId!==state.currentViewId)await selectView(snapshot.viewId);
+  if(snapshot.kind==="cic"){
+    state.cicEvents=cicResult()?.events||[];
+    state.selectedCicId=null;
+  }else{
+    if(state.target!==snapshot.target)await setTarget(snapshot.target);
+    state.detections=targetResult(snapshot.viewId,snapshot.target)?.detections||[];
+    state.selectedId=null;
+  }
+  updateCounts();renderResults();renderGroups();renderInspectionView();scheduleAutosave();
+}
+async function undoCorrection() {
+  const snapshot=state.undoStack.pop();
+  if(!snapshot)return;
+  state.redoStack.push(historySnapshot(snapshot.kind,snapshot.viewId,snapshot.target));
+  await restoreHistorySnapshot(snapshot);updateHistoryButtons();toast("已撤销上一次人工修正");
+}
+async function redoCorrection() {
+  const snapshot=state.redoStack.pop();
+  if(!snapshot)return;
+  state.undoStack.push(historySnapshot(snapshot.kind,snapshot.viewId,snapshot.target));
+  await restoreHistorySnapshot(snapshot);updateHistoryButtons();toast("已重做人工修正");
 }
 function encodeRuns(runs) {
   if (!runs?.length) return "";
@@ -1491,6 +1618,7 @@ function saveChannelNames() {
   state.project.channel_labels=labels;
   refreshChannelLabels();
   renderResults();
+  scheduleAutosave();
   toast("通道名称已保存，页面和导出表头已同步更新");
 }
 async function setTarget(target) {
@@ -1525,11 +1653,175 @@ async function randomSample() {
   await analyzeScope("current");
 }
 
+function comparePrefix(side) { return side==="left" ? "compareLeft" : "compareRight"; }
+function compareNode(side,name) { return $(`${comparePrefix(side)}${name}`); }
+function compareOther(side) { return side==="left" ? "right" : "left"; }
+function populateCompareSelectors() {
+  const options=state.project.views.map(view=>
+    `<option value="${escapeHtml(view.id)}">${escapeHtml(view.group)} / ${escapeHtml(view.name)}</option>`
+  ).join("");
+  for(const side of ["left","right"]){
+    compareNode(side,"View").innerHTML=options;
+    compareNode(side,"View").value=compareState[side].viewId||"";
+    const channelSelect=compareNode(side,"Channel");
+    channelSelect.querySelector('option[value="dapi"]').textContent=targetLabel("dapi");
+    channelSelect.querySelector('option[value="nk"]').textContent=targetLabel("nk");
+    channelSelect.querySelector('option[value="tumor"]').textContent=targetLabel("tumor");
+    channelSelect.value=compareState[side].channel;
+  }
+}
+function applyCompareTransform(side) {
+  const pane=compareState[side];
+  compareNode(side,"Stage").style.transform=`translate(${pane.panX}px,${pane.panY}px) scale(${pane.zoom})`;
+  compareNode(side,"Zoom").textContent=`${Math.round(pane.zoom*100)}%`;
+}
+function fitCompareSide(side) {
+  const pane=compareState[side],viewer=compareNode(side,"Viewer"),stage=compareNode(side,"Stage");
+  if(!pane.raw||!viewer.clientWidth||!viewer.clientHeight)return;
+  const ratio=pane.raw.width/pane.raw.height;
+  let width=viewer.clientWidth,height=width/ratio;
+  if(height>viewer.clientHeight){height=viewer.clientHeight;width=height*ratio;}
+  stage.style.width=`${width}px`;stage.style.height=`${height}px`;
+  pane.fitLeft=(viewer.clientWidth-width)/2;pane.fitTop=(viewer.clientHeight-height)/2;
+  stage.style.left=`${pane.fitLeft}px`;stage.style.top=`${pane.fitTop}px`;
+  pane.zoom=1;pane.panX=0;pane.panY=0;
+  applyCompareTransform(side);
+}
+function syncCompareViewport(sourceSide) {
+  if(!$("compareSync").checked)return;
+  const source=compareState[sourceSide],targetSide=compareOther(sourceSide),target=compareState[targetSide];
+  if(!source.raw||!target.raw)return;
+  const sourceViewer=compareNode(sourceSide,"Viewer"),sourceStage=compareNode(sourceSide,"Stage");
+  const targetViewer=compareNode(targetSide,"Viewer"),targetStage=compareNode(targetSide,"Stage");
+  const normalizedX=(sourceViewer.clientWidth/2-source.fitLeft-source.panX)/(sourceStage.clientWidth*source.zoom);
+  const normalizedY=(sourceViewer.clientHeight/2-source.fitTop-source.panY)/(sourceStage.clientHeight*source.zoom);
+  target.zoom=source.zoom;
+  target.panX=targetViewer.clientWidth/2-target.fitLeft-normalizedX*targetStage.clientWidth*target.zoom;
+  target.panY=targetViewer.clientHeight/2-target.fitTop-normalizedY*targetStage.clientHeight*target.zoom;
+  applyCompareTransform(targetSide);
+}
+function drawCompareDetections(canvas,detections,color,labelPrefix="") {
+  if(!detections?.length)return;
+  const active=detections.filter(item=>!item.deleted);
+  const mask=buildDetectionMask(canvas.width,canvas.height,active);
+  const context=canvas.getContext("2d");
+  context.drawImage(outlineMask(mask,color,2),0,0);
+  if(!state.showLabels)return;
+  active.forEach((item,index)=>{
+    context.font=`700 ${Math.max(12,Math.min(22,(item.radius||12)*.75))}px system-ui`;
+    context.textAlign="center";context.textBaseline="middle";context.lineWidth=3;
+    context.strokeStyle="rgba(0,0,0,.88)";context.fillStyle="#fff";
+    const label=`${labelPrefix}${index+1}`;
+    context.strokeText(label,item.x,item.y);context.fillText(label,item.x,item.y);
+  });
+}
+function drawCompareCic(canvas,events=[]) {
+  const context=canvas.getContext("2d");
+  let index=0;
+  for(const event of events){
+    if(event.deleted||event.classification==="rejected")continue;
+    index++;
+    const color=cicDisplayColor(event),inner=Math.max(10,event.inner_radius||event.radius||16);
+    const outer=Math.max(inner+10,event.outer_radius||inner+36);
+    context.save();context.strokeStyle=color;context.lineWidth=3;
+    if(event.classification==="pending")context.setLineDash([10,7]);
+    context.beginPath();context.arc(event.x,event.y,inner,0,Math.PI*2);context.stroke();
+    context.globalAlpha=.8;context.beginPath();context.arc(event.x,event.y,outer,0,Math.PI*2);context.stroke();
+    context.restore();
+    if(state.showLabels){
+      context.font="700 15px system-ui";context.textAlign="center";context.lineWidth=3;
+      context.strokeStyle="#05070a";context.fillStyle="#fff";
+      const prefix=event.classification==="heterotypic"?"异":event.classification==="homotypic"?"同":"?";
+      context.strokeText(`${prefix}${index}`,event.x,event.y-outer-10);context.fillText(`${prefix}${index}`,event.x,event.y-outer-10);
+    }
+  }
+}
+function updateCompareStats(side,view) {
+  const counts=viewCounts(view.id),cic=cicCounts(view.id);
+  compareNode(side,"Stats").textContent=
+    `${view.group} / ${view.name}　${targetLabel("dapi")} ${counts.dapi.total}　${targetLabel("nk")} ${counts.nk.total}　${targetLabel("tumor")} ${counts.tumor.total}　异质 CIC ${cic.heterotypic}　同质 CIC ${cic.homotypic}　待复核 ${cic.pending}`;
+}
+async function renderCompareSide(side,resetViewport=true) {
+  const pane=compareState[side],view=viewById(pane.viewId);
+  if(!view)return;
+  const requestId=Symbol(side);pane.requestId=requestId;
+  const channel=pane.channel==="cic"?"overlay":pane.channel;
+  const file=view.files[channel]||view.files.dapi;
+  compareNode(side,"Empty").textContent="正在读取本地图片…";
+  compareNode(side,"Empty").classList.remove("hidden");
+  try{
+    const decoded=await decodeRgba(file);
+    if(pane.requestId!==requestId)return;
+    pane.raw=decoded;
+    const image=compareNode(side,"Image"),overlay=compareNode(side,"Overlay");
+    image.width=overlay.width=decoded.width;image.height=overlay.height=decoded.height;
+    image.getContext("2d").putImageData(new ImageData(decoded.rgba,decoded.width,decoded.height),0,0);
+    const overlayContext=overlay.getContext("2d");overlayContext.clearRect(0,0,overlay.width,overlay.height);
+    if(pane.channel==="cic")drawCompareCic(overlay,cicResult(view.id)?.events||[]);
+    else if(TARGETS.includes(pane.channel)){
+      drawCompareDetections(overlay,targetResult(view.id,pane.channel)?.detections||[],colors[pane.channel]);
+    }else{
+      drawCompareDetections(overlay,targetResult(view.id,"dapi")?.detections||[],colors.dapi,"D");
+      drawCompareDetections(overlay,targetResult(view.id,"nk")?.detections||[],colors.nk,"N");
+      drawCompareDetections(overlay,targetResult(view.id,"tumor")?.detections||[],colors.tumor,"T");
+    }
+    compareNode(side,"Stage").style.display="block";
+    compareNode(side,"Empty").classList.add("hidden");
+    updateCompareStats(side,view);
+    if(resetViewport)fitCompareSide(side);else applyCompareTransform(side);
+  }catch(error){
+    compareNode(side,"Empty").textContent=`读取失败：${error.message}`;
+    compareNode(side,"Empty").classList.remove("hidden");
+  }
+}
+async function openCompare() {
+  if(!state.project||!state.currentViewId)return;
+  const current=viewById(state.currentViewId),sameGroup=groupViews(current.group);
+  const index=sameGroup.findIndex(view=>view.id===current.id);
+  compareState.left.viewId=current.id;
+  compareState.right.viewId=(sameGroup[index+1]||sameGroup[index-1]||current).id;
+  compareState.left.channel=state.layer==="cic"?"cic":state.channel;
+  compareState.right.channel=compareState.left.channel;
+  compareState.open=true;populateCompareSelectors();
+  $("compareDialog").classList.remove("hidden");
+  await Promise.all([renderCompareSide("left"),renderCompareSide("right")]);
+}
+function closeCompare() {
+  compareState.open=false;$("compareDialog").classList.add("hidden");
+}
+function compareZoom(side,next,clientX,clientY) {
+  const pane=compareState[side],viewer=compareNode(side,"Viewer"),rect=viewer.getBoundingClientRect();
+  const zoom=Math.max(.5,Math.min(8,next));
+  const anchorX=(clientX??rect.left+rect.width/2)-rect.left;
+  const anchorY=(clientY??rect.top+rect.height/2)-rect.top;
+  const localX=(anchorX-pane.fitLeft-pane.panX)/pane.zoom;
+  const localY=(anchorY-pane.fitTop-pane.panY)/pane.zoom;
+  pane.panX=anchorX-pane.fitLeft-localX*zoom;
+  pane.panY=anchorY-pane.fitTop-localY*zoom;
+  pane.zoom=zoom;applyCompareTransform(side);syncCompareViewport(side);
+}
+function startComparePan(side,event) {
+  if(event.button!==0||!compareState[side].raw)return;
+  const pane=compareState[side];pane.dragging=true;pane.pointerId=event.pointerId;
+  pane.startX=event.clientX;pane.startY=event.clientY;pane.originX=pane.panX;pane.originY=pane.panY;
+  compareNode(side,"Viewer").setPointerCapture(event.pointerId);
+  compareNode(side,"Viewer").classList.add("dragging");event.preventDefault();
+}
+function moveComparePan(side,event) {
+  const pane=compareState[side];if(!pane.dragging||pane.pointerId!==event.pointerId)return;
+  pane.panX=pane.originX+event.clientX-pane.startX;pane.panY=pane.originY+event.clientY-pane.startY;
+  applyCompareTransform(side);syncCompareViewport(side);
+}
+function endComparePan(side,event) {
+  const pane=compareState[side];if(!pane.dragging||pane.pointerId!==event.pointerId)return;
+  pane.dragging=false;pane.pointerId=null;compareNode(side,"Viewer").classList.remove("dragging");
+}
+
 [$("folderInput"),$("welcomeFolderInput")].forEach(input=>input.onchange=event=>scanFolder(event.target.files).catch(error=>{console.error(error);toast(error.message,true);}));
 $("projectInput").onchange=event=>event.target.files[0]&&importProject(event.target.files[0]);
 $("mappingToggleBtn").onclick=()=>$("mappingPanel").classList.toggle("hidden");
-$("selectAllGroupsBtn").onclick=()=>{state.selectedGroups=new Set(state.project.groups);renderGroups();};
-$("clearGroupsBtn").onclick=()=>{state.selectedGroups.clear();renderGroups();};
+$("selectAllGroupsBtn").onclick=()=>{state.selectedGroups=new Set(state.project.groups);renderGroups();scheduleAutosave();};
+$("clearGroupsBtn").onclick=()=>{state.selectedGroups.clear();renderGroups();scheduleAutosave();};
 $("saveChannelNamesBtn").onclick=saveChannelNames;
 $("saveProfileBtn").onclick=()=>saveParameters(false);$("applyAllBtn").onclick=()=>saveParameters(true);
 $("randomSampleBtn").onclick=randomSample;
@@ -1592,6 +1884,30 @@ $("zoomInBtn").onclick=()=>setZoom(state.zoom+.25);
 $("zoomOutBtn").onclick=()=>setZoom(state.zoom-.25);
 $("fitBtn").onclick=fitCurrentStage;
 $("centerBtn").onclick=centerStage;
+$("undoBtn").onclick=undoCorrection;
+$("redoBtn").onclick=redoCorrection;
+$("compareBtn").onclick=openCompare;
+$("compareCloseBtn").onclick=closeCompare;
+$("compareFitBtn").onclick=()=>{fitCompareSide("left");fitCompareSide("right");};
+$("compareSync").onchange=event=>event.target.checked&&syncCompareViewport("left");
+$("compareSwapBtn").onclick=async()=>{
+  const leftView=compareState.left.viewId,leftChannel=compareState.left.channel;
+  compareState.left.viewId=compareState.right.viewId;compareState.left.channel=compareState.right.channel;
+  compareState.right.viewId=leftView;compareState.right.channel=leftChannel;
+  populateCompareSelectors();
+  await Promise.all([renderCompareSide("left"),renderCompareSide("right")]);
+};
+for(const side of ["left","right"]){
+  compareNode(side,"View").onchange=event=>{compareState[side].viewId=event.target.value;renderCompareSide(side);};
+  compareNode(side,"Channel").onchange=event=>{compareState[side].channel=event.target.value;renderCompareSide(side,false);};
+  const viewer=compareNode(side,"Viewer");
+  viewer.addEventListener("wheel",event=>{event.preventDefault();compareZoom(side,compareState[side].zoom+(event.deltaY<0?.15:-.15),event.clientX,event.clientY);},{passive:false});
+  viewer.addEventListener("pointerdown",event=>startComparePan(side,event));
+  viewer.addEventListener("pointermove",event=>moveComparePan(side,event));
+  viewer.addEventListener("pointerup",event=>endComparePan(side,event));
+  viewer.addEventListener("pointercancel",event=>endComparePan(side,event));
+  viewer.ondblclick=()=>fitCompareSide(side);
+}
 $("minArea").addEventListener("input",updateAreaNote);
 $("analysisMode").addEventListener("change",updateParameterVisibility);
 $("viewer").addEventListener("wheel",event=>{event.preventDefault();setZoom(state.zoom+(event.deltaY<0?.15:-.15),event.clientX,event.clientY);},{passive:false});
@@ -1601,6 +1917,13 @@ $("viewer").addEventListener("pointerup",endPan);
 $("viewer").addEventListener("pointercancel",endPan);
 $("viewer").addEventListener("auxclick",event=>{if(event.button===1)event.preventDefault();});
 window.addEventListener("keydown",event=>{
+  if(event.key==="Escape"&&compareState.open){closeCompare();return;}
+  if((event.ctrlKey||event.metaKey)&&!isTypingTarget(event.target)&&event.key.toLowerCase()==="z"){
+    event.preventDefault();event.shiftKey?redoCorrection():undoCorrection();return;
+  }
+  if((event.ctrlKey||event.metaKey)&&!isTypingTarget(event.target)&&event.key.toLowerCase()==="y"){
+    event.preventDefault();redoCorrection();return;
+  }
   if((event.key==="Delete"||event.key==="Backspace")&&!isTypingTarget(event.target)&&state.layer==="cic"&&state.selectedCicId){
     event.preventDefault();deleteSelectedCic();return;
   }
@@ -1615,4 +1938,7 @@ window.addEventListener("keyup",event=>{
   state.spacePressed=false; updatePanCursor();
 });
 window.addEventListener("blur",()=>{state.spacePressed=false;updatePanCursor();});
-window.addEventListener("resize",()=>state.currentViewId&&viewById(state.currentViewId).width&&fitStage(viewById(state.currentViewId).width,viewById(state.currentViewId).height));
+window.addEventListener("resize",()=>{
+  if(state.currentViewId&&viewById(state.currentViewId).width)fitStage(viewById(state.currentViewId).width,viewById(state.currentViewId).height);
+  if(compareState.open){fitCompareSide("left");fitCompareSide("right");}
+});

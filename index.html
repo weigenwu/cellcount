@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; worker-src 'self' blob:; connect-src 'self' https://cdn.jsdelivr.net">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; worker-src 'self' blob:; connect-src 'self'">
   <title>CellScope · 浏览器细胞计数</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="static/styles.css">
@@ -75,6 +75,7 @@
           <button data-channel="cic" class="cic-tab"><span class="dot amber"></span>CIC 复核</button>
         </div>
         <div class="viewer-actions">
+          <button class="icon-button text compare-button" id="compareBtn" title="并排查看两个视野">双视野比较</button>
           <div class="inspection-tabs" id="inspectionTabs">
             <button data-inspection="original" class="active">原图＋真实轮廓</button>
             <button data-inspection="binary">二值核对图</button>
@@ -84,6 +85,9 @@
           <button class="icon-button" id="zoomInBtn" title="放大">＋</button>
           <button class="icon-button text" id="fitBtn">适应</button>
           <button class="icon-button text" id="centerBtn" title="保留当前倍率并让图片回到视野中心">居中</button>
+          <button class="icon-button text" id="undoBtn" title="撤销上一次人工修正" disabled>撤销</button>
+          <button class="icon-button text" id="redoBtn" title="重做上一次人工修正" disabled>重做</button>
+          <span id="autosaveStatus" class="autosave-status">自动保存待命</span>
         </div>
       </div>
 
@@ -244,7 +248,58 @@
   </main>
 
   <div id="toast" class="toast"></div>
-  <script src="https://cdn.jsdelivr.net/npm/utif@3.1.0/UTIF.min.js" crossorigin="anonymous"></script>
+  <section id="compareDialog" class="compare-dialog hidden" aria-label="双视野并排比较">
+    <header class="compare-header">
+      <div>
+        <span class="eyebrow">SIDE-BY-SIDE REVIEW</span>
+        <h2>双视野并排比较</h2>
+      </div>
+      <div class="compare-global-actions">
+        <label><input id="compareSync" type="checkbox" checked> 同步缩放与拖拽</label>
+        <button id="compareFitBtn">两侧适应</button>
+        <button id="compareSwapBtn">交换左右</button>
+        <button id="compareCloseBtn" class="danger">关闭</button>
+      </div>
+    </header>
+    <div class="compare-grid">
+      <article class="compare-pane" data-side="left">
+        <div class="compare-pane-toolbar">
+          <select id="compareLeftView" aria-label="左侧视野"></select>
+          <select id="compareLeftChannel" aria-label="左侧通道">
+            <option value="overlay">合并图</option><option value="dapi">DAPI</option>
+            <option value="nk">NK</option><option value="tumor">肿瘤</option><option value="cic">CIC 标注</option>
+          </select>
+          <span id="compareLeftZoom">100%</span>
+        </div>
+        <div id="compareLeftViewer" class="compare-viewer">
+          <div id="compareLeftStage" class="compare-stage">
+            <canvas id="compareLeftImage"></canvas><canvas id="compareLeftOverlay"></canvas>
+          </div>
+          <div id="compareLeftEmpty" class="compare-empty">请选择视野</div>
+          <div id="compareLeftStats" class="compare-stats"></div>
+        </div>
+      </article>
+      <article class="compare-pane" data-side="right">
+        <div class="compare-pane-toolbar">
+          <select id="compareRightView" aria-label="右侧视野"></select>
+          <select id="compareRightChannel" aria-label="右侧通道">
+            <option value="overlay">合并图</option><option value="dapi">DAPI</option>
+            <option value="nk">NK</option><option value="tumor">肿瘤</option><option value="cic">CIC 标注</option>
+          </select>
+          <span id="compareRightZoom">100%</span>
+        </div>
+        <div id="compareRightViewer" class="compare-viewer">
+          <div id="compareRightStage" class="compare-stage">
+            <canvas id="compareRightImage"></canvas><canvas id="compareRightOverlay"></canvas>
+          </div>
+          <div id="compareRightEmpty" class="compare-empty">请选择视野</div>
+          <div id="compareRightStats" class="compare-stats"></div>
+        </div>
+      </article>
+    </div>
+    <footer class="compare-help">滚轮缩放 · 左键拖拽 · 双击适应窗口；同步模式按相同图像坐标对齐，适合比较同尺寸视野。</footer>
+  </section>
+  <script src="static/vendor/UTIF.min.js"></script>
   <script src="browser-app.js"></script>
 </body>
 </html>
