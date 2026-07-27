@@ -454,8 +454,13 @@ async function analyzeScope(scope) {
     scope === "pending" ? state.project.views.filter(view => targetStatus(view.id,target) !== "done") : state.project.views;
   views = views.filter(view => !view.error);
   if (!views.length) return toast("没有未完成且可分析的视野");
-  if (views.some(view => countTargetDetections(targetResult(view.id,target)?.detections||[]).corrected > 0) &&
-      !confirm(`所选范围包含 ${targetLabel(target)} 人工修正，重新分析会清除这些修正。是否继续？`)) return;
+  const label = targetLabel(target);
+  if (views.some(view => countTargetDetections(targetResult(view.id,target)?.detections||[]).corrected > 0)) {
+    const guidance = target === "dapi"
+      ? `\n\n当前计数对象仍是 ${label}。若要分析 ${targetLabel("nk")} 或 ${targetLabel("tumor")}，请先选择对应通道。`
+      : "";
+    if (!confirm(`当前正在重新分析 ${label}。所选范围包含 ${label} 自身的人工修正，继续只会清除这些 ${label} 修正；其他通道不受影响。是否继续？${guidance}`)) return;
+  }
   state.cancelled = false;
   state.busy = true;
   $("jobPanel").classList.remove("hidden");
@@ -519,6 +524,15 @@ function updateCounts() {
   $("countTumor").textContent=targetStatus(state.currentViewId,"tumor")==="done"?counts.tumor.total:"—";
   $("countNk").textContent=targetStatus(state.currentViewId,"nk")==="done"?counts.nk.total:"—";
   $("currentTargetName").textContent=targetLabel(state.target);
+  updateActionLabels();
+}
+function updateActionLabels() {
+  if (!state.project) return;
+  const label=targetLabel(state.target);
+  $("analyzeCurrentBtn").textContent=`预跑当前图片（${label}）`;
+  $("analyzeGroupBtn").textContent=`批量当前组（${label}）`;
+  $("analyzeAllBtn").textContent=`批量全部视野（${label}）`;
+  $("resumeBtn").textContent=`继续 ${label} 未完成视野`;
 }
 function renderResults() {
   if (!state.project) return;
@@ -682,6 +696,7 @@ function refreshChannelLabels() {
   $("currentTargetName").textContent=targetLabel(state.target);
   if (state.currentGroup) $("profileGroup").textContent=`${state.currentGroup} · ${targetLabel(state.target)}`;
   $("calibrationWarning").textContent=`推荐顺序：选择 ${targetLabel("dapi")} → 随机预跑 → 保存阈值 → 批量；然后对 ${targetLabel("nk")}、${targetLabel("tumor")} 分别重复。三类参数互不覆盖。`;
+  updateActionLabels();
   if (state.currentGroup) updateParameterVisibility();
 }
 function saveChannelNames() {
@@ -748,7 +763,11 @@ $("overlayCanvas").onclick=handleCanvasClick;
 $("selectModeBtn").onclick=()=>{state.mode="select";$("selectModeBtn").classList.add("active");$("addModeBtn").classList.remove("active");};
 $("addModeBtn").onclick=()=>{state.mode="add";$("addModeBtn").classList.add("active");$("selectModeBtn").classList.remove("active");};
 $("deleteDetectionBtn").onclick=deleteSelected;
-document.querySelectorAll("#channelTabs button").forEach(button=>button.onclick=()=>{
+document.querySelectorAll("#channelTabs button").forEach(button=>button.onclick=async()=>{
+  if (TARGETS.includes(button.dataset.channel)) {
+    await setTarget(button.dataset.channel);
+    return;
+  }
   document.querySelectorAll("#channelTabs button").forEach(item=>item.classList.remove("active"));button.classList.add("active");
   state.channel=button.dataset.channel;showImage();
 });

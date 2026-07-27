@@ -374,6 +374,9 @@ async function analyze(payload) {
       detections.push({
         ...nucleus,
         id:`auto-${detections.length + 1}`,
+        manual:false,
+        deleted:false,
+        anchor_manual:Boolean(nucleus.manual),
         positive_fraction:signal.fraction,
         signal_background:signal.background,
       });
