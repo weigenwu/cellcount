@@ -64,9 +64,9 @@
         </div>
         <div class="channel-tabs" id="channelTabs">
           <button data-channel="overlay" class="active">合并</button>
-          <button data-channel="dapi"><span class="dot blue"></span>DAPI</button>
-          <button data-channel="nk"><span class="dot green"></span>NK</button>
-          <button data-channel="tumor"><span class="dot red"></span>肿瘤</button>
+          <button data-channel="dapi"><span class="dot blue"></span><span id="viewerLabelDapi">DAPI</span></button>
+          <button data-channel="nk"><span class="dot green"></span><span id="viewerLabelNk">NK</span></button>
+          <button data-channel="tumor"><span class="dot red"></span><span id="viewerLabelTumor">肿瘤</span></button>
         </div>
         <div class="viewer-actions">
           <div class="inspection-tabs" id="inspectionTabs">
@@ -88,9 +88,9 @@
         <div id="viewerEmpty" class="viewer-empty">选择左侧视野以查看图像</div>
         <div id="decodeBusy" class="decode-busy hidden"><i></i><span>正在读取本地图片…</span></div>
         <div class="legend">
-          <button data-class="dapi" class="active"><span class="blue"></span>DAPI</button>
-          <button data-class="nk" class="active"><span class="green"></span>NK</button>
-          <button data-class="tumor" class="active"><span class="red"></span>肿瘤</button>
+          <button data-class="dapi" class="active"><span class="blue"></span><span id="legendLabelDapi">DAPI</span></button>
+          <button data-class="nk" class="active"><span class="green"></span><span id="legendLabelNk">NK</span></button>
+          <button data-class="tumor" class="active"><span class="red"></span><span id="legendLabelTumor">肿瘤</span></button>
           <button id="labelsToggle" class="active">显示编号</button>
         </div>
       </div>
@@ -117,7 +117,7 @@
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>实验组 / 视野</th><th>DAPI</th><th>NK</th><th>肿瘤</th><th>修正</th><th>三类进度</th></tr></thead>
+            <thead><tr><th>实验组 / 视野</th><th id="resultHeaderDapi">DAPI</th><th id="resultHeaderNk">NK</th><th id="resultHeaderTumor">肿瘤</th><th>修正</th><th>三类进度</th></tr></thead>
             <tbody id="resultsBody"></tbody>
           </table>
         </div>
@@ -130,10 +130,20 @@
         <span id="pixelSizeBadge" class="unit-badge">0.218 µm/px</span>
       </div>
       <div class="target-picker" id="targetPicker">
-        <button data-target="dapi" class="active"><span class="dot blue"></span>DAPI</button>
-        <button data-target="nk"><span class="dot green"></span>NK</button>
-        <button data-target="tumor"><span class="dot red"></span>肿瘤</button>
+        <button data-target="dapi" class="active"><span class="dot blue"></span><span id="targetLabelDapi">DAPI</span></button>
+        <button data-target="nk"><span class="dot green"></span><span id="targetLabelNk">NK</span></button>
+        <button data-target="tumor"><span class="dot red"></span><span id="targetLabelTumor">肿瘤</span></button>
       </div>
+      <details class="channel-name-editor">
+        <summary>修改三条通道的显示名称</summary>
+        <div class="channel-name-fields">
+          <label><span class="dot blue"></span><input id="channelNameDapi" value="DAPI" maxlength="30" aria-label="蓝色通道名称"></label>
+          <label><span class="dot green"></span><input id="channelNameNk" value="NK" maxlength="30" aria-label="绿色通道名称"></label>
+          <label><span class="dot red"></span><input id="channelNameTumor" value="肿瘤" maxlength="30" aria-label="红色通道名称"></label>
+        </div>
+        <p>只修改页面和导出结果中的名称，不改变 ch00 / ch01 / ch02 文件配对。</p>
+        <button id="saveChannelNamesBtn">保存通道名称</button>
+      </details>
       <div class="profile-scope">
         <span>当前预设</span><strong id="profileGroup">—</strong>
         <button id="applyAllBtn">应用到全部组</button>
@@ -158,9 +168,9 @@
       <button class="button sample-button" id="randomSampleBtn">随机抽取当前组一张预跑</button>
       <button class="button save-profile" id="saveProfileBtn">保存当前类别参数</button>
       <div class="count-cards">
-        <article><span>DAPI 总数</span><strong id="countDapi">—</strong></article>
-        <article class="nk"><span>NK 细胞</span><strong id="countNk">—</strong></article>
-        <article class="tumor"><span>肿瘤细胞</span><strong id="countTumor">—</strong></article>
+        <article><span id="countLabelDapi">DAPI 总数</span><strong id="countDapi">—</strong></article>
+        <article class="nk"><span id="countLabelNk">NK 总数</span><strong id="countNk">—</strong></article>
+        <article class="tumor"><span id="countLabelTumor">肿瘤 总数</span><strong id="countTumor">—</strong></article>
         <article class="review"><span>当前计数对象</span><strong id="currentTargetName">DAPI</strong></article>
       </div>
       <div class="batch-actions">
@@ -175,7 +185,7 @@
         <p id="jobCurrent">准备中…</p>
         <button id="cancelBtn">停止批处理</button>
       </div>
-      <p class="calibration-warning">推荐顺序：选择 DAPI → 随机预跑 → 保存阈值 → 批量；然后对 NK、肿瘤分别重复。三类参数互不覆盖。</p>
+      <p id="calibrationWarning" class="calibration-warning">推荐顺序：选择 DAPI → 随机预跑 → 保存阈值 → 批量；然后对 NK、肿瘤分别重复。三类参数互不覆盖。</p>
     </aside>
   </main>
 

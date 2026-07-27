@@ -1,12 +1,12 @@
 /* global UTIF */
 const DEFAULTS = {
-  threshold_mode: "manual", threshold_low: 20, threshold_high: 129,
+  threshold_mode: "manual", threshold_low: 15, threshold_high: 255,
   gaussian_sigma: 1, opening_radius: 1, watershed_min_distance: 12,
   min_area_px: 400, max_area_px: 20000, min_circularity: 0.03,
   max_circularity: 1,
 };
 const TARGETS = ["dapi", "nk", "tumor"];
-const TARGET_LABELS = {dapi:"DAPI", nk:"NK", tumor:"肿瘤"};
+const DEFAULT_CHANNEL_LABELS = {dapi:"DAPI", nk:"NK", tumor:"肿瘤"};
 const state = {
   project: null, currentViewId: null, currentGroup: null, channel: "overlay", target: "dapi",
   detections: [], selectedId: null, mode: "select", zoom: 1, worker: null,
@@ -17,6 +17,9 @@ const state = {
 const $ = id => document.getElementById(id);
 const colors = {dapi:"#4d7cff", tumor:"#ff4a5b", nk:"#41e090"};
 const supported = new Set([".tif", ".tiff", ".png", ".jpg", ".jpeg"]);
+function targetLabel(target) {
+  return state.project?.channel_labels?.[target] || DEFAULT_CHANNEL_LABELS[target];
+}
 
 function toast(message, error=false) {
   const node = $("toast");
@@ -65,8 +68,8 @@ async function scanFolder(fileList) {
     });
     const nk = findAny(base + suffixes.nk), tumor = findAny(base + suffixes.tumor), overlay = findAny(base);
     const errors = [];
-    if (!nk) errors.push("缺少绿色 NK 通道");
-    if (!tumor) errors.push("缺少红色肿瘤通道");
+    if (!nk) errors.push(`缺少绿色 ${targetLabel("nk")} 通道`);
+    if (!tumor) errors.push(`缺少红色 ${targetLabel("tumor")} 通道`);
     views.push({
       id: `${group}/${base}`, group, name: base,
       files: {dapi:file, nk:nk?.file || null, tumor:tumor?.file || null, overlay:overlay?.file || file},
@@ -74,11 +77,12 @@ async function scanFolder(fileList) {
       width:0, height:0, status:errors.length ? "error" : "pending", error:errors.join("；"),
     });
   }
-  if (!views.length) return toast(`没有找到以 ${suffixes.dapi} 结尾的 DAPI 图片`, true);
+  if (!views.length) return toast(`没有找到以 ${suffixes.dapi} 结尾的 ${targetLabel("dapi")} 图片`, true);
   views.sort((a,b) => a.id.localeCompare(b.id, "zh-CN", {numeric:true}));
   const groups = [...new Set(views.map(view => view.group))];
   state.project = {
     version:1, browserVersion:true, name:root, pixel_size_um:pixelSizeUm, suffixes,
+    channel_labels:{...DEFAULT_CHANNEL_LABELS},
     groups, views,
     parameters_by_group:Object.fromEntries(groups.map(group => [
       group,
@@ -99,6 +103,7 @@ function mergePendingProject() {
     toast("项目文件与所选图片文件夹名称不同，未合并旧结果", true);
     return;
   }
+  state.project.channel_labels = {...DEFAULT_CHANNEL_LABELS, ...(saved.channel_labels || {})};
   for (const group of state.project.groups) {
     const savedGroup = saved.parameters_by_group?.[group];
     if (!savedGroup) continue;
@@ -137,7 +142,7 @@ function openWorkspace() {
   $("projectName").textContent = state.project.name;
   $("projectMeta").textContent = `${state.project.groups.length} 个实验组 · ${state.project.views.length} 个视野`;
   $("pixelSizeBadge").textContent = `${state.project.pixel_size_um} µm/px`;
-  renderGroups(); renderResults();
+  refreshChannelLabels(); renderGroups(); renderResults();
   const first = state.project.views.find(view => !view.error) || state.project.views[0];
   if (first) selectView(first.id);
   toast(`已在浏览器中识别 ${state.project.views.length} 个视野`);
@@ -183,7 +188,7 @@ async function selectView(id) {
   state.currentGroup = view.group;
   $("currentGroupLabel").textContent = view.group;
   $("currentViewLabel").textContent = view.name;
-  $("profileGroup").textContent = `${view.group} · ${TARGET_LABELS[state.target]}`;
+  $("profileGroup").textContent = `${view.group} · ${targetLabel(state.target)}`;
   populateParameters(state.project.parameters_by_group[view.group][state.target]);
   state.detections = targetResult(id)?.detections || [];
   updateCounts();
@@ -361,7 +366,7 @@ function saveParameters(all=false) {
   if (params.threshold_low > params.threshold_high) return toast("阈值下限不能大于上限", true);
   state.project.parameters_by_group[state.currentGroup][state.target] = params;
   if (all) state.project.groups.forEach(group => state.project.parameters_by_group[group][state.target] = {...params});
-  toast(all ? `${TARGET_LABELS[state.target]} 参数已应用到全部实验组` : `已保存“${state.currentGroup}”的 ${TARGET_LABELS[state.target]} 参数`);
+  toast(all ? `${targetLabel(state.target)} 参数已应用到全部实验组` : `已保存“${state.currentGroup}”的 ${targetLabel(state.target)} 参数`);
 }
 function updateAreaNote() {
   if (!state.project) return;
@@ -396,7 +401,7 @@ function analyzeOne(view, params, target) {
     try {
       const channelBuffer = await view.files[target].arrayBuffer();
       worker.postMessage({
-        type:"analyze", params, target, targetLabel:TARGET_LABELS[target],
+        type:"analyze", params, target, targetLabel:targetLabel(target),
         pixelSizeUm:state.project.pixel_size_um,
         channelBuffer, channelExtension:extension(view.files[target].name),
       },[channelBuffer]);
@@ -418,7 +423,7 @@ async function analyzeScope(scope) {
   views = views.filter(view => !view.error);
   if (!views.length) return toast("没有未完成且可分析的视野");
   if (views.some(view => countTargetDetections(targetResult(view.id,target)?.detections||[]).corrected > 0) &&
-      !confirm(`所选范围包含 ${TARGET_LABELS[target]} 人工修正，重新分析会清除这些修正。是否继续？`)) return;
+      !confirm(`所选范围包含 ${targetLabel(target)} 人工修正，重新分析会清除这些修正。是否继续？`)) return;
   state.cancelled = false;
   state.busy = true;
   $("jobPanel").classList.remove("hidden");
@@ -463,7 +468,7 @@ async function analyzeScope(scope) {
     state.detections=targetResult(state.currentViewId)?.detections||[];
     updateCounts(); renderInspectionView();
   }
-  toast(state.cancelled ? `${TARGET_LABELS[target]} 批处理已停止，已完成结果仍保留` : `${TARGET_LABELS[target]} 分析完成`);
+  toast(state.cancelled ? `${targetLabel(target)} 批处理已停止，已完成结果仍保留` : `${targetLabel(target)} 分析完成`);
 }
 
 function countTargetDetections(detections=[]) {
@@ -481,7 +486,7 @@ function updateCounts() {
   $("countDapi").textContent=targetStatus(state.currentViewId,"dapi")==="done"?counts.dapi.total:"—";
   $("countTumor").textContent=targetStatus(state.currentViewId,"tumor")==="done"?counts.tumor.total:"—";
   $("countNk").textContent=targetStatus(state.currentViewId,"nk")==="done"?counts.nk.total:"—";
-  $("currentTargetName").textContent=TARGET_LABELS[state.target];
+  $("currentTargetName").textContent=targetLabel(state.target);
 }
 function renderResults() {
   if (!state.project) return;
@@ -489,8 +494,8 @@ function renderResults() {
   $("resultsBody").innerHTML=state.project.views.map(view=>{
     const c=viewCounts(view.id);
     const corrected=c.dapi.corrected+c.nk.corrected+c.tumor.corrected;
-    const status=`DAPI ${short[targetStatus(view.id,"dapi")]} · NK ${short[targetStatus(view.id,"nk")]} · 肿瘤 ${short[targetStatus(view.id,"tumor")]}`;
-    return `<tr><td>${escapeHtml(view.group)} / ${escapeHtml(view.name)}</td><td>${targetStatus(view.id,"dapi")==="done"?c.dapi.total:"—"}</td><td>${targetStatus(view.id,"nk")==="done"?c.nk.total:"—"}</td><td>${targetStatus(view.id,"tumor")==="done"?c.tumor.total:"—"}</td><td>${corrected}</td><td class="status-${overallStatus(view)}" title="${escapeHtml(view.error||"")}">${status}</td></tr>`;
+    const status=TARGETS.map(target=>`${targetLabel(target)} ${short[targetStatus(view.id,target)]}`).join(" · ");
+    return `<tr><td>${escapeHtml(view.group)} / ${escapeHtml(view.name)}</td><td>${targetStatus(view.id,"dapi")==="done"?c.dapi.total:"—"}</td><td>${targetStatus(view.id,"nk")==="done"?c.nk.total:"—"}</td><td>${targetStatus(view.id,"tumor")==="done"?c.tumor.total:"—"}</td><td>${corrected}</td><td class="status-${overallStatus(view)}" title="${escapeHtml(view.error||"")}">${escapeHtml(status)}</td></tr>`;
   }).join("");
 }
 
@@ -499,7 +504,7 @@ function canvasPoint(event) {
   return {x:(event.clientX-rect.left)*canvas.width/rect.width,y:(event.clientY-rect.top)*canvas.height/rect.height};
 }
 function handleCanvasClick(event) {
-  if (!targetResult(state.currentViewId)?.detections) return toast(`请先预跑当前视野的 ${TARGET_LABELS[state.target]}`);
+  if (!targetResult(state.currentViewId)?.detections) return toast(`请先预跑当前视野的 ${targetLabel(state.target)}`);
   const point=canvasPoint(event);
   if (state.mode==="add") {
     state.detections.push({id:`manual-${Date.now()}`,x:point.x,y:point.y,area_px:452.39,area_um2:452.39*state.project.pixel_size_um**2,radius:12,circularity:1,classification:state.target,manual:true,deleted:false});
@@ -542,7 +547,8 @@ function serializableProject() {
   }
   return {
     version:1,browserVersion:true,name:state.project.name,pixel_size_um:state.project.pixel_size_um,
-    suffixes:state.project.suffixes,groups:state.project.groups,parameters_by_group:state.project.parameters_by_group,
+    suffixes:state.project.suffixes,channel_labels:state.project.channel_labels,
+    groups:state.project.groups,parameters_by_group:state.project.parameters_by_group,
     views:state.project.views.map(({id,group,name,width,height,status,error,fileNames})=>({id,group,name,width,height,status,error,fileNames})),
     results:serializedResults,updated_at:new Date().toISOString(),
   };
@@ -583,7 +589,13 @@ function downloadBlob(blob,name) {
   setTimeout(()=>URL.revokeObjectURL(url),1000);
 }
 function csvText() {
-  const headers=["实验组","视野","DAPI总数","NK细胞","肿瘤细胞","DAPI修正数","NK修正数","肿瘤修正数","DAPI状态","NK状态","肿瘤状态","错误"];
+  const headers=[
+    "实验组","视野",
+    ...TARGETS.map(target=>`${targetLabel(target)}总数`),
+    ...TARGETS.map(target=>`${targetLabel(target)}修正数`),
+    ...TARGETS.map(target=>`${targetLabel(target)}状态`),
+    "错误"
+  ];
   const rows=state.project.views.map(view=>{
     const c=viewCounts(view.id);
     return [
@@ -621,6 +633,37 @@ async function importProject(file) {
 }
 function setZoom(value){state.zoom=Math.max(.5,Math.min(4,value));$("imageStage").style.transform=`scale(${state.zoom})`;$("zoomLabel").textContent=`${Math.round(state.zoom*100)}%`;}
 function formatSeconds(value){return value<60?`${Math.ceil(value)} 秒`:`${Math.ceil(value/60)} 分钟`;}
+function refreshChannelLabels() {
+  if (!state.project) return;
+  const suffix = {dapi:"Dapi",nk:"Nk",tumor:"Tumor"};
+  for (const target of TARGETS) {
+    const label=targetLabel(target);
+    const key=suffix[target];
+    $(`viewerLabel${key}`).textContent=label;
+    $(`legendLabel${key}`).textContent=label;
+    $(`targetLabel${key}`).textContent=label;
+    $(`resultHeader${key}`).textContent=label;
+    $(`countLabel${key}`).textContent=`${label} 总数`;
+    $(`channelName${key}`).value=label;
+  }
+  $("targetParameterTitle").textContent=`${targetLabel(state.target)} 独立计数参数`;
+  $("currentTargetName").textContent=targetLabel(state.target);
+  if (state.currentGroup) $("profileGroup").textContent=`${state.currentGroup} · ${targetLabel(state.target)}`;
+  $("calibrationWarning").textContent=`推荐顺序：选择 ${targetLabel("dapi")} → 随机预跑 → 保存阈值 → 批量；然后对 ${targetLabel("nk")}、${targetLabel("tumor")} 分别重复。三类参数互不覆盖。`;
+}
+function saveChannelNames() {
+  if (!state.project) return;
+  const labels={
+    dapi:$("channelNameDapi").value.trim(),
+    nk:$("channelNameNk").value.trim(),
+    tumor:$("channelNameTumor").value.trim(),
+  };
+  if (TARGETS.some(target=>!labels[target])) return toast("三条通道名称都不能为空",true);
+  state.project.channel_labels=labels;
+  refreshChannelLabels();
+  renderResults();
+  toast("通道名称已保存，页面和导出表头已同步更新");
+}
 async function setTarget(target) {
   if (!TARGETS.includes(target) || !state.project) return;
   if (state.busy) return toast("请先等待当前类别分析完成，或点击停止批处理");
@@ -630,10 +673,10 @@ async function setTarget(target) {
   document.querySelectorAll("#channelTabs button").forEach(button=>button.classList.toggle("active",button.dataset.channel===target));
   const dot=$("targetDot");
   dot.className=`dot ${target==="tumor"?"red":target==="nk"?"green":"blue"}`;
-  $("targetParameterTitle").textContent=`${TARGET_LABELS[target]} 独立计数参数`;
-  $("currentTargetName").textContent=TARGET_LABELS[target];
+  $("targetParameterTitle").textContent=`${targetLabel(target)} 独立计数参数`;
+  $("currentTargetName").textContent=targetLabel(target);
   if (state.currentGroup) {
-    $("profileGroup").textContent=`${state.currentGroup} · ${TARGET_LABELS[target]}`;
+    $("profileGroup").textContent=`${state.currentGroup} · ${targetLabel(target)}`;
     populateParameters(state.project.parameters_by_group[state.currentGroup][target]);
   }
   state.detections=state.currentViewId?targetResult(state.currentViewId,target)?.detections||[]:[];
@@ -654,6 +697,7 @@ async function randomSample() {
 [$("folderInput"),$("welcomeFolderInput")].forEach(input=>input.onchange=event=>scanFolder(event.target.files).catch(error=>{console.error(error);toast(error.message,true);}));
 $("projectInput").onchange=event=>event.target.files[0]&&importProject(event.target.files[0]);
 $("mappingToggleBtn").onclick=()=>$("mappingPanel").classList.toggle("hidden");
+$("saveChannelNamesBtn").onclick=saveChannelNames;
 $("saveProfileBtn").onclick=()=>saveParameters(false);$("applyAllBtn").onclick=()=>saveParameters(true);
 $("randomSampleBtn").onclick=randomSample;
 $("targetPicker").querySelectorAll("button").forEach(button=>button.onclick=()=>setTarget(button.dataset.target));
