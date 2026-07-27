@@ -38,6 +38,8 @@
 .viewer.pan-ready, .viewer.pan-ready .image-stage { cursor: grab; }
 .viewer.is-panning, .viewer.is-panning .image-stage { cursor: grabbing; }
 .viewer.is-panning canvas { pointer-events: none; }
+.review-mode button.delete { color: #ff8a95; }
+.review-mode button.delete.active { border-color: #ff4a5b; color: #ffb0b7; background: #2a1820; }
 @media (max-width: 700px) {
   .welcome { padding: 9vh 22px; }
   .browser-notes { margin-top: 8vh; }

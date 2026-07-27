@@ -575,6 +575,24 @@ function canvasPoint(event) {
   const canvas=$("overlayCanvas"),rect=canvas.getBoundingClientRect();
   return {x:(event.clientX-rect.left)*canvas.width/rect.width,y:(event.clientY-rect.top)*canvas.height/rect.height};
 }
+function detectionAtPoint(point) {
+  const candidates=state.detections.filter(item=>!item.deleted);
+  const pixelX=Math.round(point.x), pixelY=Math.round(point.y);
+  const inside=candidates.find(item=>{
+    if (!item.runs?.length) return false;
+    for (let index=0; index<item.runs.length; index+=3) {
+      if (item.runs[index]===pixelY && pixelX>=item.runs[index+1] && pixelX<=item.runs[index+2]) return true;
+    }
+    return false;
+  });
+  if (inside) return inside;
+  let best=null,distance=Infinity;
+  candidates.forEach(item=>{
+    const d=Math.hypot(item.x-point.x,item.y-point.y);
+    if(d<Math.max(20,item.radius*1.5)&&d<distance){best=item;distance=d;}
+  });
+  return best;
+}
 function handleCanvasClick(event) {
   if (state.mode==="pan") return;
   if (!targetResult(state.currentViewId)?.detections) return toast(`请先预跑当前视野的 ${targetLabel(state.target)}`);
@@ -583,12 +601,14 @@ function handleCanvasClick(event) {
     state.detections.push({id:`manual-${Date.now()}`,x:point.x,y:point.y,area_px:452.39,area_um2:452.39*state.project.pixel_size_um**2,radius:12,circularity:1,classification:state.target,manual:true,deleted:false});
     syncCorrections(); return;
   }
-  let best=null,distance=Infinity;
-  state.detections.forEach(item=>{
-    if(item.deleted)return;
-    const d=Math.hypot(item.x-point.x,item.y-point.y);
-    if(d<Math.max(20,item.radius*1.5)&&d<distance){best=item;distance=d;}
-  });
+  const best=detectionAtPoint(point);
+  if (state.mode==="delete") {
+    if (!best) { $("selectionHint").textContent="未点中细胞标记"; return; }
+    best.deleted=true; best.manual=true;
+    syncCorrections();
+    $("selectionHint").textContent=`已删除 ${best.id}`;
+    return;
+  }
   state.selectedId=best?.id||null;
   $("selectionHint").textContent=best?`已选择 ${best.id}`:"未选中标记";
   drawOverlay();
@@ -602,8 +622,10 @@ function reclassify(classification) {
   item.classification=state.target;item.manual=true;syncCorrections();
 }
 function deleteSelected() {
-  const item=state.detections.find(d=>d.id===state.selectedId);if(!item)return;
+  const item=state.detections.find(d=>d.id===state.selectedId);
+  if(!item) return toast("请先选择要删除的细胞标记",true);
   item.deleted=true;item.manual=true;syncCorrections();
+  $("selectionHint").textContent=`已删除 ${item.id}`;
 }
 
 function serializableProject() {
@@ -874,7 +896,14 @@ function fitCurrentStage() {
 }
 function setReviewMode(mode) {
   state.mode=mode;
-  for (const name of ["select","add","pan"]) $(`${name}ModeBtn`).classList.toggle("active",name===mode);
+  for (const name of ["select","add","delete","pan"]) $(`${name}ModeBtn`).classList.toggle("active",name===mode);
+  const hints={
+    select:"点击标记后可使用右侧删除按钮或键盘 Delete",
+    add:`点击图片可添加并计入当前 ${targetLabel(state.target)}`,
+    delete:"点击错误识别的轮廓或编号即可删除",
+    pan:"按住左键拖动图片；滚轮可缩放",
+  };
+  $("selectionHint").textContent=hints[mode];
   updatePanCursor();
 }
 function updatePanCursor() {
@@ -997,6 +1026,7 @@ $("exportBtn").onclick=exportResults;$("annotatedBtn").onclick=exportAnnotated;
 $("overlayCanvas").onclick=handleCanvasClick;
 $("selectModeBtn").onclick=()=>setReviewMode("select");
 $("addModeBtn").onclick=()=>setReviewMode("add");
+$("deleteModeBtn").onclick=()=>setReviewMode("delete");
 $("panModeBtn").onclick=()=>setReviewMode("pan");
 $("deleteDetectionBtn").onclick=deleteSelected;
 document.querySelectorAll("#channelTabs button").forEach(button=>button.onclick=async()=>{
@@ -1037,6 +1067,9 @@ $("viewer").addEventListener("pointerup",endPan);
 $("viewer").addEventListener("pointercancel",endPan);
 $("viewer").addEventListener("auxclick",event=>{if(event.button===1)event.preventDefault();});
 window.addEventListener("keydown",event=>{
+  if((event.key==="Delete" || event.key==="Backspace") && !isTypingTarget(event.target) && state.selectedId){
+    event.preventDefault(); deleteSelected(); return;
+  }
   if(event.code!=="Space" || isTypingTarget(event.target)) return;
   event.preventDefault(); state.spacePressed=true; updatePanCursor();
 });
