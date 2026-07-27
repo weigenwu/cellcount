@@ -23,6 +23,10 @@ const state = {
   inspectionMode: "original", showLabels: true, rawImage: null,
   visibleClasses: new Set(["dapi", "tumor", "nk"]),
   selectedGroups: new Set(),
+  panX: 0, panY: 0, fitLeft: 0, fitTop: 0,
+  spacePressed: false, panning: false, panPointerId: null,
+  panStartX: 0, panStartY: 0, panOriginX: 0, panOriginY: 0,
+  panMoved: false,
 };
 const $ = id => document.getElementById(id);
 const colors = {dapi:"#4d7cff", tumor:"#ff4a5b", nk:"#41e090"};
@@ -263,9 +267,12 @@ function fitStage(width, height) {
   if (displayHeight > viewer.clientHeight) { displayHeight = viewer.clientHeight; displayWidth = displayHeight * ratio; }
   const stage = $("imageStage");
   stage.style.width = `${displayWidth}px`; stage.style.height = `${displayHeight}px`;
-  stage.style.left = `${(viewer.clientWidth - displayWidth)/2}px`;
-  stage.style.top = `${(viewer.clientHeight - displayHeight)/2}px`;
-  setZoom(1);
+  state.fitLeft = (viewer.clientWidth - displayWidth) / 2;
+  state.fitTop = (viewer.clientHeight - displayHeight) / 2;
+  stage.style.left = `${state.fitLeft}px`;
+  stage.style.top = `${state.fitTop}px`;
+  state.panX = 0; state.panY = 0; state.zoom = 1;
+  applyViewportTransform();
 }
 
 function buildDetectionMask(width, height, detections, visibleClasses=null) {
@@ -569,6 +576,7 @@ function canvasPoint(event) {
   return {x:(event.clientX-rect.left)*canvas.width/rect.width,y:(event.clientY-rect.top)*canvas.height/rect.height};
 }
 function handleCanvasClick(event) {
+  if (state.mode==="pan") return;
   if (!targetResult(state.currentViewId)?.detections) return toast(`请先预跑当前视野的 ${targetLabel(state.target)}`);
   const point=canvasPoint(event);
   if (state.mode==="add") {
@@ -834,7 +842,75 @@ async function importProject(file) {
     else toast("项目已读取，请重新选择对应的原始图片文件夹");
   } catch(error){toast(`项目文件无效：${error.message}`,true);}
 }
-function setZoom(value){state.zoom=Math.max(.5,Math.min(4,value));$("imageStage").style.transform=`scale(${state.zoom})`;$("zoomLabel").textContent=`${Math.round(state.zoom*100)}%`;}
+function applyViewportTransform() {
+  $("imageStage").style.transform=`translate(${state.panX}px, ${state.panY}px) scale(${state.zoom})`;
+  $("zoomLabel").textContent=`${Math.round(state.zoom*100)}%`;
+}
+function setZoom(value, clientX=null, clientY=null) {
+  const next=Math.max(.5,Math.min(8,value));
+  if (next===state.zoom) return;
+  const viewer=$("viewer"), rect=viewer.getBoundingClientRect();
+  const anchorX=clientX ?? rect.left+rect.width/2;
+  const anchorY=clientY ?? rect.top+rect.height/2;
+  const localX=(anchorX-rect.left-state.fitLeft-state.panX)/state.zoom;
+  const localY=(anchorY-rect.top-state.fitTop-state.panY)/state.zoom;
+  state.panX=anchorX-rect.left-state.fitLeft-localX*next;
+  state.panY=anchorY-rect.top-state.fitTop-localY*next;
+  state.zoom=next;
+  applyViewportTransform();
+}
+function centerStage() {
+  const stage=$("imageStage"), viewer=$("viewer");
+  state.panX=(viewer.clientWidth-stage.clientWidth*state.zoom)/2-state.fitLeft;
+  state.panY=(viewer.clientHeight-stage.clientHeight*state.zoom)/2-state.fitTop;
+  applyViewportTransform();
+}
+function fitCurrentStage() {
+  if (!state.currentViewId) return;
+  const view=viewById(state.currentViewId);
+  const width=state.rawImage?.width || view?.width;
+  const height=state.rawImage?.height || view?.height;
+  if (width&&height) fitStage(width,height);
+}
+function setReviewMode(mode) {
+  state.mode=mode;
+  for (const name of ["select","add","pan"]) $(`${name}ModeBtn`).classList.toggle("active",name===mode);
+  updatePanCursor();
+}
+function updatePanCursor() {
+  const ready=state.mode==="pan" || state.spacePressed;
+  $("viewer").classList.toggle("pan-ready",ready && !state.panning);
+  $("viewer").classList.toggle("is-panning",state.panning);
+}
+function shouldStartPan(event) {
+  return event.button===1 || (event.button===0 && (state.mode==="pan" || state.spacePressed));
+}
+function startPan(event) {
+  if (!shouldStartPan(event) || event.target.closest("button") || $("imageStage").style.display==="none") return;
+  event.preventDefault();
+  state.panning=true; state.panPointerId=event.pointerId;
+  state.panStartX=event.clientX; state.panStartY=event.clientY;
+  state.panOriginX=state.panX; state.panOriginY=state.panY;
+  state.panMoved=false;
+  $("viewer").setPointerCapture(event.pointerId);
+  updatePanCursor();
+}
+function movePan(event) {
+  if (!state.panning || event.pointerId!==state.panPointerId) return;
+  const dx=event.clientX-state.panStartX, dy=event.clientY-state.panStartY;
+  if (Math.hypot(dx,dy)>3) state.panMoved=true;
+  state.panX=state.panOriginX+dx; state.panY=state.panOriginY+dy;
+  applyViewportTransform();
+}
+function endPan(event) {
+  if (!state.panning || event.pointerId!==state.panPointerId) return;
+  state.panning=false; state.panPointerId=null;
+  if ($("viewer").hasPointerCapture(event.pointerId)) $("viewer").releasePointerCapture(event.pointerId);
+  updatePanCursor();
+}
+function isTypingTarget(target) {
+  return ["INPUT","TEXTAREA","SELECT"].includes(target?.tagName) || target?.isContentEditable;
+}
 function formatSeconds(value){return value<60?`${Math.ceil(value)} 秒`:`${Math.ceil(value/60)} 分钟`;}
 function refreshChannelLabels() {
   if (!state.project) return;
@@ -919,8 +995,9 @@ $("cancelBtn").onclick=()=>{
 };
 $("exportBtn").onclick=exportResults;$("annotatedBtn").onclick=exportAnnotated;
 $("overlayCanvas").onclick=handleCanvasClick;
-$("selectModeBtn").onclick=()=>{state.mode="select";$("selectModeBtn").classList.add("active");$("addModeBtn").classList.remove("active");};
-$("addModeBtn").onclick=()=>{state.mode="add";$("addModeBtn").classList.add("active");$("selectModeBtn").classList.remove("active");};
+$("selectModeBtn").onclick=()=>setReviewMode("select");
+$("addModeBtn").onclick=()=>setReviewMode("add");
+$("panModeBtn").onclick=()=>setReviewMode("pan");
 $("deleteDetectionBtn").onclick=deleteSelected;
 document.querySelectorAll("#channelTabs button").forEach(button=>button.onclick=async()=>{
   if (TARGETS.includes(button.dataset.channel)) {
@@ -947,8 +1024,25 @@ $("labelsToggle").onclick=()=>{
 document.querySelectorAll(".legend button[data-class]").forEach(button=>button.onclick=()=>{
   button.classList.toggle("active");button.classList.contains("active")?state.visibleClasses.add(button.dataset.class):state.visibleClasses.delete(button.dataset.class);renderInspectionView();
 });
-$("zoomInBtn").onclick=()=>setZoom(state.zoom+.25);$("zoomOutBtn").onclick=()=>setZoom(state.zoom-.25);$("fitBtn").onclick=()=>setZoom(1);
+$("zoomInBtn").onclick=()=>setZoom(state.zoom+.25);
+$("zoomOutBtn").onclick=()=>setZoom(state.zoom-.25);
+$("fitBtn").onclick=fitCurrentStage;
+$("centerBtn").onclick=centerStage;
 $("minArea").addEventListener("input",updateAreaNote);
 $("analysisMode").addEventListener("change",updateParameterVisibility);
-$("viewer").addEventListener("wheel",event=>{event.preventDefault();setZoom(state.zoom+(event.deltaY<0?.15:-.15));},{passive:false});
+$("viewer").addEventListener("wheel",event=>{event.preventDefault();setZoom(state.zoom+(event.deltaY<0?.15:-.15),event.clientX,event.clientY);},{passive:false});
+$("viewer").addEventListener("pointerdown",startPan);
+$("viewer").addEventListener("pointermove",movePan);
+$("viewer").addEventListener("pointerup",endPan);
+$("viewer").addEventListener("pointercancel",endPan);
+$("viewer").addEventListener("auxclick",event=>{if(event.button===1)event.preventDefault();});
+window.addEventListener("keydown",event=>{
+  if(event.code!=="Space" || isTypingTarget(event.target)) return;
+  event.preventDefault(); state.spacePressed=true; updatePanCursor();
+});
+window.addEventListener("keyup",event=>{
+  if(event.code!=="Space") return;
+  state.spacePressed=false; updatePanCursor();
+});
+window.addEventListener("blur",()=>{state.spacePressed=false;updatePanCursor();});
 window.addEventListener("resize",()=>state.currentViewId&&viewById(state.currentViewId).width&&fitStage(viewById(state.currentViewId).width,viewById(state.currentViewId).height));

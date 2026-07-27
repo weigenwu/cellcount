@@ -33,6 +33,11 @@
 .inspection-tabs button { border: 0; background: transparent; color: #77869a; padding: 6px 8px; border-radius: 5px; cursor: pointer; font-size: 9px; }
 .inspection-tabs button.active { background: #2a3547; color: white; }
 #labelsToggle { border-left: 1px solid #2b3543; margin-left: 2px; }
+.viewer { touch-action: none; }
+.image-stage { transform-origin: 0 0; }
+.viewer.pan-ready, .viewer.pan-ready .image-stage { cursor: grab; }
+.viewer.is-panning, .viewer.is-panning .image-stage { cursor: grabbing; }
+.viewer.is-panning canvas { pointer-events: none; }
 @media (max-width: 700px) {
   .welcome { padding: 9vh 22px; }
   .browser-notes { margin-top: 8vh; }
