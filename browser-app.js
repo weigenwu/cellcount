@@ -2,7 +2,7 @@
 const DEFAULTS = {
   threshold_mode: "manual", threshold_low: 15, threshold_high: 255,
   gaussian_sigma: 1, opening_radius: 1, watershed_min_distance: 12,
-  min_area_px: 400, max_area_px: 20000, min_circularity: 0.03,
+  min_area_px: 400, max_area_px: 20000, min_circularity: 0.3,
   max_circularity: 1,
 };
 const TARGETS = ["dapi", "nk", "tumor"];
