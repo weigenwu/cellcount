@@ -247,6 +247,7 @@ function regionDetections(labels, width, height, params) {
         circularity < params.min_circularity || circularity > params.max_circularity) continue;
     detections.push({
       id: `auto-${detections.length + 1}`,
+      _label: label,
       x: sumX[label] / area[label],
       y: sumY[label] / area[label],
       area_px: area[label],
@@ -257,6 +258,26 @@ function regionDetections(labels, width, height, params) {
     });
   }
   return detections;
+}
+
+function attachMaskRuns(labels, width, height, detections) {
+  const byLabel = new Map();
+  for (const detection of detections) {
+    detection.runs = [];
+    byLabel.set(detection._label, detection);
+  }
+  for (let y = 0; y < height; y++) {
+    let x = 0;
+    while (x < width) {
+      const label = labels[y * width + x];
+      const start = x;
+      x++;
+      while (x < width && labels[y * width + x] === label) x++;
+      const detection = byLabel.get(label);
+      if (detection) detection.runs.push(y, start, x - 1);
+    }
+  }
+  for (const detection of detections) delete detection._label;
 }
 
 function positivity(signal, width, height, detection, radiusPx, threshold) {
@@ -300,6 +321,7 @@ async function analyze(payload) {
   const labels = floodLabels(mask, width, height, seeds);
   postProgress("筛选颗粒", 0.76);
   const detections = regionDetections(labels, width, height, payload.params);
+  attachMaskRuns(labels, width, height, detections);
   for (const detection of detections) {
     detection.classification = payload.target;
     detection.area_um2 = detection.area_px * payload.pixelSizeUm ** 2;

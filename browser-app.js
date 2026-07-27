@@ -11,6 +11,7 @@ const state = {
   project: null, currentViewId: null, currentGroup: null, channel: "overlay", target: "dapi",
   detections: [], selectedId: null, mode: "select", zoom: 1, worker: null,
   cancelled: false, cancelReject: null, pendingProject: null, busy: false,
+  inspectionMode: "original", showLabels: true, rawImage: null,
   visibleClasses: new Set(["dapi", "tumor", "nk"]),
 };
 const $ = id => document.getElementById(id);
@@ -111,9 +112,16 @@ function mergePendingProject() {
   }
   for (const view of state.project.views) {
     if (saved.results?.[view.id]) {
-      const savedResult = saved.results[view.id];
-      if (savedResult.dapi || savedResult.nk || savedResult.tumor) {
-        state.project.results[view.id] = savedResult;
+    const savedResult = saved.results[view.id];
+    if (savedResult.dapi || savedResult.nk || savedResult.tumor) {
+        state.project.results[view.id] = {};
+        for (const target of TARGETS) {
+          if (!savedResult[target]) continue;
+          state.project.results[view.id][target] = {
+            ...savedResult[target],
+            detections:(savedResult[target].detections||[]).map(inflateDetection)
+          };
+        }
       }
       view.status = overallStatus(view);
     }
@@ -212,11 +220,11 @@ async function showImage() {
     const imageCanvas = $("imageCanvas"), overlay = $("overlayCanvas");
     imageCanvas.width = overlay.width = decoded.width;
     imageCanvas.height = overlay.height = decoded.height;
-    imageCanvas.getContext("2d").putImageData(new ImageData(decoded.rgba, decoded.width, decoded.height), 0, 0);
+    state.rawImage = decoded;
     fitStage(decoded.width, decoded.height);
     $("imageStage").style.display = "block";
     $("viewerEmpty").classList.add("hidden");
-    drawOverlay();
+    renderInspectionView();
   } catch (error) { toast(error.message, true); }
   finally { $("decodeBusy").classList.add("hidden"); }
 }
@@ -232,21 +240,104 @@ function fitStage(width, height) {
   setZoom(1);
 }
 
-function drawOverlay(target=$("overlayCanvas")) {
+function buildAcceptedMask() {
+  const source = $("overlayCanvas");
+  const mask = document.createElement("canvas");
+  mask.width = source.width; mask.height = source.height;
+  const context = mask.getContext("2d");
+  context.fillStyle = "#fff";
+  for (const item of state.detections) {
+    if (item.deleted || !state.visibleClasses.has(item.classification)) continue;
+    if (item.runs?.length) {
+      for (let i=0; i<item.runs.length; i+=3) {
+        const y=item.runs[i], start=item.runs[i+1], end=item.runs[i+2];
+        context.fillRect(start,y,end-start+1,1);
+      }
+    } else {
+      context.beginPath();
+      context.arc(item.x,item.y,Math.max(8,item.radius||12),0,Math.PI*2);
+      context.fill();
+    }
+  }
+  return mask;
+}
+
+function tintMask(mask, color) {
+  const output=document.createElement("canvas");
+  output.width=mask.width;output.height=mask.height;
+  const context=output.getContext("2d");
+  context.drawImage(mask,0,0);
+  context.globalCompositeOperation="source-in";
+  context.fillStyle=color;
+  context.fillRect(0,0,output.width,output.height);
+  context.globalCompositeOperation="source-over";
+  return output;
+}
+
+function outlineMask(mask, color, width=3) {
+  const output=document.createElement("canvas");
+  output.width=mask.width;output.height=mask.height;
+  const context=output.getContext("2d");
+  for (let offset=-width;offset<=width;offset++) {
+    context.drawImage(mask,offset,-width);
+    context.drawImage(mask,offset,width);
+    context.drawImage(mask,-width,offset);
+    context.drawImage(mask,width,offset);
+  }
+  context.globalCompositeOperation="destination-out";
+  context.drawImage(mask,0,0);
+  context.globalCompositeOperation="source-in";
+  context.fillStyle=color;
+  context.fillRect(0,0,output.width,output.height);
+  context.globalCompositeOperation="source-over";
+  return output;
+}
+
+function renderInspectionView() {
+  const imageCanvas=$("imageCanvas");
+  if (!imageCanvas.width || !state.rawImage) return;
+  const context=imageCanvas.getContext("2d");
+  context.clearRect(0,0,imageCanvas.width,imageCanvas.height);
+  const mask=buildAcceptedMask();
+  if (state.inspectionMode==="binary") {
+    context.fillStyle="#fff";
+    context.fillRect(0,0,imageCanvas.width,imageCanvas.height);
+    context.drawImage(tintMask(mask,"#050505"),0,0);
+  } else {
+    context.putImageData(new ImageData(state.rawImage.rgba,state.rawImage.width,state.rawImage.height),0,0);
+  }
+  drawOverlay($("overlayCanvas"),mask);
+}
+
+function drawOverlay(target=$("overlayCanvas"), existingMask=null) {
   if (!target.width) return;
-  const context = target.getContext("2d");
+  const context=target.getContext("2d");
   context.clearRect(0,0,target.width,target.height);
-  context.font = "20px system-ui";
-  state.detections.forEach((item,index) => {
-    if (item.deleted || !state.visibleClasses.has(item.classification)) return;
-    context.strokeStyle = context.fillStyle = colors[item.classification] || "#fff";
-    context.lineWidth = item.id === state.selectedId ? 6 : 3;
-    context.beginPath();
-    context.arc(item.x,item.y,Math.max(8,item.radius||12),0,Math.PI*2);
-    context.stroke();
-    if (item.id === state.selectedId) { context.globalAlpha=.18; context.fill(); context.globalAlpha=1; }
-    context.fillText(String(index+1),item.x+(item.radius||12)+3,item.y-5);
-  });
+  const mask=existingMask||buildAcceptedMask();
+  const outlineColor=state.inspectionMode==="binary"?"#ffe600":colors[state.target];
+  context.drawImage(outlineMask(mask,outlineColor,state.inspectionMode==="binary"?3:2),0,0);
+  let activeIndex=0;
+  for (const item of state.detections) {
+    if (item.deleted || !state.visibleClasses.has(item.classification)) continue;
+    activeIndex++;
+    if (item.id===state.selectedId) {
+      context.strokeStyle="#fff";
+      context.lineWidth=4;
+      context.beginPath();
+      context.arc(item.x,item.y,Math.max(9,item.radius||12)+5,0,Math.PI*2);
+      context.stroke();
+    }
+    if (!state.showLabels) continue;
+    const fontSize=Math.max(13,Math.min(24,(item.radius||12)*0.8));
+    context.font=`700 ${fontSize}px system-ui`;
+    context.textAlign="center";
+    context.textBaseline="middle";
+    context.lineWidth=3;
+    context.strokeStyle=state.inspectionMode==="binary"?"#111":"rgba(0,0,0,.85)";
+    context.fillStyle="#fff";
+    context.strokeText(String(activeIndex),item.x,item.y);
+    context.fillText(String(activeIndex),item.x,item.y);
+  }
 }
 
 const fieldMap = {
@@ -370,7 +461,7 @@ async function analyzeScope(scope) {
   $("jobPanel").classList.add("hidden");
   if (state.currentViewId) {
     state.detections=targetResult(state.currentViewId)?.detections||[];
-    updateCounts(); drawOverlay();
+    updateCounts(); renderInspectionView();
   }
   toast(state.cancelled ? `${TARGET_LABELS[target]} 批处理已停止，已完成结果仍保留` : `${TARGET_LABELS[target]} 分析完成`);
 }
@@ -426,7 +517,7 @@ function handleCanvasClick(event) {
 }
 function syncCorrections() {
   state.project.results[state.currentViewId][state.target].detections=state.detections;
-  state.selectedId=null; updateCounts(); drawOverlay(); renderResults();
+  state.selectedId=null; updateCounts(); renderInspectionView(); renderResults();
 }
 function reclassify(classification) {
   const item=state.detections.find(d=>d.id===state.selectedId); if(!item)return;
@@ -438,12 +529,53 @@ function deleteSelected() {
 }
 
 function serializableProject() {
+  const serializedResults={};
+  for (const [viewId,viewResult] of Object.entries(state.project.results)) {
+    serializedResults[viewId]={};
+    for (const target of TARGETS) {
+      if (!viewResult[target]) continue;
+      serializedResults[viewId][target]={
+        ...viewResult[target],
+        detections:(viewResult[target].detections||[]).map(deflateDetection)
+      };
+    }
+  }
   return {
     version:1,browserVersion:true,name:state.project.name,pixel_size_um:state.project.pixel_size_um,
     suffixes:state.project.suffixes,groups:state.project.groups,parameters_by_group:state.project.parameters_by_group,
     views:state.project.views.map(({id,group,name,width,height,status,error,fileNames})=>({id,group,name,width,height,status,error,fileNames})),
-    results:state.project.results,updated_at:new Date().toISOString(),
+    results:serializedResults,updated_at:new Date().toISOString(),
   };
+}
+function encodeRuns(runs) {
+  if (!runs?.length) return "";
+  const values=new Uint16Array(runs);
+  const bytes=new Uint8Array(values.buffer);
+  let binary="";
+  const chunk=0x8000;
+  for (let offset=0;offset<bytes.length;offset+=chunk) {
+    binary+=String.fromCharCode(...bytes.subarray(offset,offset+chunk));
+  }
+  return btoa(binary);
+}
+function decodeRuns(encoded) {
+  if (!encoded) return [];
+  const binary=atob(encoded);
+  const bytes=new Uint8Array(binary.length);
+  for (let i=0;i<binary.length;i++) bytes[i]=binary.charCodeAt(i);
+  return Array.from(new Uint16Array(bytes.buffer));
+}
+function deflateDetection(detection) {
+  const output={...detection};
+  if (output.runs?.length) output.mask_rle=encodeRuns(output.runs);
+  delete output.runs;
+  return output;
+}
+function inflateDetection(detection) {
+  const output={...detection};
+  if (!output.runs?.length&&output.mask_rle) output.runs=decodeRuns(output.mask_rle);
+  delete output.mask_rle;
+  return output;
 }
 function downloadBlob(blob,name) {
   const url=URL.createObjectURL(blob),link=document.createElement("a");
@@ -507,7 +639,7 @@ async function setTarget(target) {
   state.detections=state.currentViewId?targetResult(state.currentViewId,target)?.detections||[]:[];
   state.selectedId=null;
   updateCounts();
-  drawOverlay();
+  renderInspectionView();
   if (state.currentViewId) await showImage();
 }
 async function randomSample() {
@@ -543,8 +675,22 @@ document.querySelectorAll("#channelTabs button").forEach(button=>button.onclick=
   document.querySelectorAll("#channelTabs button").forEach(item=>item.classList.remove("active"));button.classList.add("active");
   state.channel=button.dataset.channel;showImage();
 });
-document.querySelectorAll(".legend button").forEach(button=>button.onclick=()=>{
-  button.classList.toggle("active");button.classList.contains("active")?state.visibleClasses.add(button.dataset.class):state.visibleClasses.delete(button.dataset.class);drawOverlay();
+document.querySelectorAll("#inspectionTabs button").forEach(button=>button.onclick=()=>{
+  if(button.dataset.inspection==="binary"&&state.detections.some(item=>!item.manual&&!item.runs?.length)){
+    return toast("这个结果没有保存真实掩膜，请重新预跑当前类别后查看二值核对图",true);
+  }
+  state.inspectionMode=button.dataset.inspection;
+  document.querySelectorAll("#inspectionTabs button").forEach(item=>item.classList.toggle("active",item===button));
+  renderInspectionView();
+});
+$("labelsToggle").onclick=()=>{
+  state.showLabels=!state.showLabels;
+  $("labelsToggle").classList.toggle("active",state.showLabels);
+  $("labelsToggle").textContent=state.showLabels?"显示编号":"隐藏编号";
+  drawOverlay();
+};
+document.querySelectorAll(".legend button[data-class]").forEach(button=>button.onclick=()=>{
+  button.classList.toggle("active");button.classList.contains("active")?state.visibleClasses.add(button.dataset.class):state.visibleClasses.delete(button.dataset.class);renderInspectionView();
 });
 $("zoomInBtn").onclick=()=>setZoom(state.zoom+.25);$("zoomOutBtn").onclick=()=>setZoom(state.zoom-.25);$("fitBtn").onclick=()=>setZoom(1);
 $("minArea").addEventListener("input",updateAreaNote);

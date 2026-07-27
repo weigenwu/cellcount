@@ -69,6 +69,10 @@
           <button data-channel="tumor"><span class="dot red"></span>肿瘤</button>
         </div>
         <div class="viewer-actions">
+          <div class="inspection-tabs" id="inspectionTabs">
+            <button data-inspection="original" class="active">原图＋真实轮廓</button>
+            <button data-inspection="binary">二值核对图</button>
+          </div>
           <button class="icon-button" id="zoomOutBtn" title="缩小">−</button>
           <span id="zoomLabel">100%</span>
           <button class="icon-button" id="zoomInBtn" title="放大">＋</button>
@@ -87,6 +91,7 @@
           <button data-class="dapi" class="active"><span class="blue"></span>DAPI</button>
           <button data-class="nk" class="active"><span class="green"></span>NK</button>
           <button data-class="tumor" class="active"><span class="red"></span>肿瘤</button>
+          <button id="labelsToggle" class="active">显示编号</button>
         </div>
       </div>
 
