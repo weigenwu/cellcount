@@ -212,12 +212,15 @@
         <summary><span class="dot amber"></span>CIC 候选筛查与复核</summary>
         <p class="parameter-note">先完成 DAPI、NK、肿瘤计数。自动结果只作为二维候选，必须人工确认后才计入同质或异质 CIC。</p>
         <div class="fields">
-          <label>最小包围比例<input id="cicMinCoverage" type="number" min="0.25" max="1" step="0.01" value="0.75"></label>
+          <label class="full">异质 CIC 判定策略<select id="cicEvidenceProfile"><option value="ppt_annotated">标注 PPT 增强判定（推荐）</option><option value="strict_complete">仅完整包围（更保守）</option></select></label>
+          <label>最小包围比例<input id="cicMinCoverage" type="number" min="0.25" max="1" step="0.01" value="0.55"></label>
           <label>红色环宽 <small>px</small><input id="cicRingWidth" type="number" min="8" max="120" value="36"></label>
           <label>环/内部最小差异<input id="cicMinContrast" type="number" min="-0.5" max="1" step="0.01" value="0.05"></label>
           <label>单图最多候选<input id="cicMaxCandidates" type="number" min="10" max="1000" value="200"></label>
           <label class="full check-field"><input id="cicHomotypicEnabled" type="checkbox" checked> 同时筛查同质 CIC 候选（肿瘤–肿瘤，判定更保守）</label>
         </div>
+        <button class="button ghost full cic-ppt-preset" id="cicPptPresetBtn">应用到当前实验组：CIC 标注 PPT 推荐参数</button>
+        <p class="parameter-note">增强判定会排除核坐标重合的假双阳性，并联合检查红色信号的象限覆盖、对侧支持、最大连续缺口及内外两层一致性。A 级接近完整包围，B 级为标注中常见的部分包围；两级都必须人工确认。</p>
         <div class="cic-count-cards">
           <article class="hetero"><span>异质 CIC</span><strong id="countCicHeterotypic">—</strong></article>
           <article class="homo"><span>同质 CIC</span><strong id="countCicHomotypic">—</strong></article>

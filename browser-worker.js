@@ -374,9 +374,14 @@ function enclosureMetrics(red,width,height,detection,params,redThreshold) {
   const sectorCount=16;
   const sectorPixels=new Uint32Array(sectorCount);
   const sectorPositive=new Uint32Array(sectorCount);
+  const nearPixels=new Uint32Array(sectorCount);
+  const nearPositive=new Uint32Array(sectorCount);
+  const farPixels=new Uint32Array(sectorCount);
+  const farPositive=new Uint32Array(sectorCount);
   let ringSum=0,ringPixels=0,innerSum=0,innerPixels=0;
   const inner2=(innerRadius*.8)**2;
   const ringStart2=(innerRadius*1.05)**2;
+  const middle2=(innerRadius+ringWidth*.52)**2;
   const outer2=outerRadius**2;
   for(let y=y0;y<=y1;y++){
     for(let x=x0;x<=x1;x++){
@@ -388,46 +393,119 @@ function enclosureMetrics(red,width,height,detection,params,redThreshold) {
       if(angle<0)angle+=Math.PI*2;
       const sector=Math.min(sectorCount-1,Math.floor(angle/(Math.PI*2)*sectorCount));
       sectorPixels[sector]++;ringPixels++;ringSum+=value;
+      if(d2<=middle2){
+        nearPixels[sector]++;
+        if(value>=redThreshold)nearPositive[sector]++;
+      }else{
+        farPixels[sector]++;
+        if(value>=redThreshold)farPositive[sector]++;
+      }
       if(value>=redThreshold)sectorPositive[sector]++;
     }
   }
   let enclosedSectors=0;
   const requiredFraction=Math.max(.02,Number(params.sector_positive_fraction)||.18);
+  const flags=[],nearFlags=[],farFlags=[];
   for(let sector=0;sector<sectorCount;sector++){
-    if(sectorPixels[sector]&&sectorPositive[sector]/sectorPixels[sector]>=requiredFraction)enclosedSectors++;
+    const positive=Boolean(sectorPixels[sector]&&sectorPositive[sector]/sectorPixels[sector]>=requiredFraction);
+    const near=Boolean(nearPixels[sector]&&nearPositive[sector]/nearPixels[sector]>=requiredFraction);
+    const far=Boolean(farPixels[sector]&&farPositive[sector]/farPixels[sector]>=requiredFraction);
+    flags.push(positive);nearFlags.push(near);farFlags.push(far);
+    if(positive)enclosedSectors++;
+  }
+  let oppositePairs=0,radialSectors=0;
+  for(let sector=0;sector<sectorCount/2;sector++){
+    if(flags[sector]&&flags[sector+sectorCount/2])oppositePairs++;
+  }
+  for(let sector=0;sector<sectorCount;sector++){
+    if(nearFlags[sector]&&farFlags[sector])radialSectors++;
+  }
+  let quadrantCount=0;
+  for(let quadrant=0;quadrant<4;quadrant++){
+    if(flags.slice(quadrant*4,quadrant*4+4).some(Boolean))quadrantCount++;
+  }
+  let largestGap=0,currentGap=0;
+  for(let index=0;index<sectorCount*2;index++){
+    if(flags[index%sectorCount])currentGap=0;
+    else{currentGap++;largestGap=Math.max(largestGap,Math.min(currentGap,sectorCount));}
   }
   const ringMean=ringPixels?ringSum/ringPixels:0;
   const innerMean=innerPixels?innerSum/innerPixels:0;
   return {
     coverage:enclosedSectors/sectorCount,
     contrast:(ringMean-innerMean)/(ringMean+10),
+    oppositePairs,quadrantCount,largestGap,
+    radialCoherence:radialSectors/sectorCount,
+    nearCoverage:nearFlags.filter(Boolean).length/sectorCount,
+    farCoverage:farFlags.filter(Boolean).length/sectorCount,
     ringMean,innerMean,innerRadius,outerRadius,
   };
 }
-function nearestDetection(origin,detections,maxDistance,excludeId=null) {
+function nearestHostDetection(origin,detections,metrics,params,excludeId=null) {
   let best=null,bestDistance=Infinity;
   for(const item of detections){
     if(item.id===excludeId)continue;
     const distance=Math.hypot(item.x-origin.x,item.y-origin.y);
-    if(distance<bestDistance&&distance<=maxDistance){best=item;bestDistance=distance;}
+    const combinedRadius=Math.max(4,(Number(origin.radius)||12)+(Number(item.radius)||12));
+    const minimum=combinedRadius*Math.max(.35,Number(params.min_host_separation_factor)||.58);
+    const adaptiveMaximum=Math.min(
+      Math.max(20,Number(params.host_max_distance_px)||150),
+      metrics.outerRadius+(Number(item.radius)||12)*Math.max(1,Number(params.host_radius_allowance)||1.8)
+    );
+    if(distance<minimum||distance>adaptiveMaximum)continue;
+    if(distance<bestDistance){best=item;bestDistance=distance;}
   }
   return best?{item:best,distance:bestDistance}:null;
 }
-function cicConfidence(metrics,hostDistance,params,type) {
+function heterotypicEvidence(metrics,params) {
+  const requested=Math.max(.25,Number(params.min_enclosure_coverage)||.55);
+  const strict=metrics.coverage>=Math.max(.8,requested)
+    &&metrics.contrast>=params.min_ring_contrast
+    &&metrics.oppositePairs>=3&&metrics.quadrantCount===4
+    &&metrics.largestGap<=3&&metrics.radialCoherence>=.44;
+  const annotated=params.evidence_profile!=="strict_complete"
+    &&metrics.coverage>=requested
+    &&metrics.contrast>=params.min_ring_contrast
+    &&metrics.oppositePairs>=2&&metrics.quadrantCount>=3
+    &&metrics.largestGap<=6&&metrics.radialCoherence>=.25;
+  if(strict)return{pass:true,grade:"A",rule:"complete_multidirectional_enclosure"};
+  if(annotated)return{pass:true,grade:"B",rule:"ppt_annotated_partial_enclosure"};
+  return{pass:false,grade:"",rule:"insufficient_multidirectional_enclosure"};
+}
+function cicConfidence(metrics,hostDistance,params,type,grade="A",areaRatio=1) {
   const minCoverage=type==="homotypic"?params.homotypic_min_coverage:params.min_enclosure_coverage;
   const coverageScore=Math.max(0,Math.min(1,(metrics.coverage-minCoverage)/(1-minCoverage+.001)));
   const contrastScore=Math.max(0,Math.min(1,(metrics.contrast-params.min_ring_contrast)/.45));
   const proximityScore=Math.max(0,1-hostDistance/Math.max(1,params.host_max_distance_px));
-  return Math.min(.99,.45+.25*coverageScore+.2*contrastScore+.1*proximityScore);
+  const morphologyScore=Math.min(1,
+    metrics.oppositePairs/5*.3+metrics.quadrantCount/4*.2+
+    (1-metrics.largestGap/16)*.2+metrics.radialCoherence*.3
+  );
+  const sizeScore=Math.max(0,Math.min(1,1/Math.max(1,areaRatio)));
+  const gradeBase=grade==="A"?.48:.39;
+  return Math.min(.99,gradeBase+.17*coverageScore+.13*contrastScore+.1*proximityScore+.09*morphologyScore+.04*sizeScore);
+}
+function median(values) {
+  if(!values.length)return 0;
+  const sorted=[...values].sort((a,b)=>a-b);
+  const middle=Math.floor(sorted.length/2);
+  return sorted.length%2?sorted[middle]:(sorted[middle-1]+sorted[middle])/2;
 }
 function analyzeCicCandidates(red,width,height,nkDetections,tumorDetections,params) {
   const redThreshold=Math.max(12,histogramQuantile(red,Number(params.red_quantile)||.72));
   const events=[];
+  const typicalNkRadius=median(nkDetections.map(item=>Number(item.radius)||0).filter(value=>value>0));
   for(const inner of nkDetections){
+    const innerSizeRatio=typicalNkRadius?(Number(inner.radius)||12)/typicalNkRadius:1;
+    if(!inner.manual&&innerSizeRatio>Math.max(1.2,Number(params.max_inner_radius_factor)||1.8))continue;
     const metrics=enclosureMetrics(red,width,height,inner,params,redThreshold);
-    if(metrics.coverage<params.min_enclosure_coverage||metrics.contrast<params.min_ring_contrast)continue;
-    const host=nearestDetection(inner,tumorDetections,params.host_max_distance_px);
+    const evidence=heterotypicEvidence(metrics,params);
+    if(!evidence.pass)continue;
+    const host=nearestHostDetection(inner,tumorDetections,metrics,params);
     if(!host)continue;
+    const areaRatio=(Number(inner.area_px)||Math.PI*(inner.radius||12)**2)
+      /Math.max(1,Number(host.item.area_px)||Math.PI*(host.item.radius||12)**2);
+    if(areaRatio>Math.max(1,Number(params.max_inner_host_area_ratio)||1.5))continue;
     events.push({
       id:`cic-auto-hetero-${events.length+1}`,
       x:inner.x,y:inner.y,inner_radius:metrics.innerRadius,outer_radius:metrics.outerRadius,
@@ -436,7 +514,14 @@ function analyzeCicCandidates(red,width,height,nkDetections,tumorDetections,para
       inner_cell_type:"nk",outer_cell_type:"tumor",
       type_hint:"heterotypic",classification:"pending",
       enclosure_coverage:metrics.coverage,ring_contrast:metrics.contrast,
-      confidence:cicConfidence(metrics,host.distance,params,"heterotypic"),
+      evidence_grade:evidence.grade,evidence_rule:evidence.rule,
+      opposite_pairs:metrics.oppositePairs,quadrant_count:metrics.quadrantCount,
+      largest_gap_sectors:metrics.largestGap,radial_coherence:metrics.radialCoherence,
+      near_coverage:metrics.nearCoverage,far_coverage:metrics.farCoverage,
+      host_distance_px:host.distance,inner_host_area_ratio:areaRatio,
+      inner_radius_typical_ratio:innerSizeRatio,
+      inner_positive_fraction:Number(inner.positive_fraction)||null,
+      confidence:cicConfidence(metrics,host.distance,params,"heterotypic",evidence.grade,areaRatio),
       red_threshold:redThreshold,source:"automatic_2d_candidate",manual:false,reviewed:false,deleted:false,
     });
   }
@@ -445,7 +530,7 @@ function analyzeCicCandidates(red,width,height,nkDetections,tumorDetections,para
     for(const inner of tumorDetections){
       const metrics=enclosureMetrics(red,width,height,inner,params,redThreshold);
       if(metrics.coverage<params.homotypic_min_coverage||metrics.contrast<params.min_ring_contrast)continue;
-      const host=nearestDetection(inner,tumorDetections,params.host_max_distance_px,inner.id);
+      const host=nearestHostDetection(inner,tumorDetections,metrics,params,inner.id);
       if(!host||host.item.circularity>params.homotypic_host_max_circularity)continue;
       const key=[inner.id,host.item.id].sort().join("|");
       const candidate={
@@ -455,7 +540,12 @@ function analyzeCicCandidates(red,width,height,nkDetections,tumorDetections,para
         inner_cell_type:"tumor",outer_cell_type:"tumor",
         type_hint:"homotypic",classification:"pending",
         enclosure_coverage:metrics.coverage,ring_contrast:metrics.contrast,
-        confidence:cicConfidence(metrics,host.distance,params,"homotypic"),
+        evidence_grade:"A",evidence_rule:"conservative_homotypic_enclosure",
+        opposite_pairs:metrics.oppositePairs,quadrant_count:metrics.quadrantCount,
+        largest_gap_sectors:metrics.largestGap,radial_coherence:metrics.radialCoherence,
+        near_coverage:metrics.nearCoverage,far_coverage:metrics.farCoverage,
+        host_distance_px:host.distance,
+        confidence:cicConfidence(metrics,host.distance,params,"homotypic","A",1),
         red_threshold:redThreshold,source:"automatic_2d_candidate",manual:false,reviewed:false,deleted:false,
       };
       if(!pairs.has(key)||candidate.confidence>pairs.get(key).confidence)pairs.set(key,candidate);
@@ -465,7 +555,8 @@ function analyzeCicCandidates(red,width,height,nkDetections,tumorDetections,para
       events.push(candidate);
     }
   }
-  events.sort((a,b)=>b.confidence-a.confidence);
+  const gradeRank=event=>event.evidence_grade==="A"?2:event.evidence_grade==="B"?1:0;
+  events.sort((a,b)=>gradeRank(b)-gradeRank(a)||b.confidence-a.confidence);
   const limit=Math.max(10,Math.round(params.max_candidates||200));
   return events.slice(0,limit).map((event,index)=>({...event,id:`cic-auto-${index+1}`}));
 }

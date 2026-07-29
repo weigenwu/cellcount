@@ -8,7 +8,9 @@ const DEFAULTS = {
 const TARGETS = ["dapi", "nk", "tumor"];
 const DEFAULT_CHANNEL_LABELS = {dapi:"DAPI", nk:"NK", tumor:"肿瘤"};
 const DEFAULT_CIC_PARAMS = {
-  min_enclosure_coverage:0.75,
+  evidence_profile:"ppt_annotated",
+  rule_version:3,
+  min_enclosure_coverage:0.55,
   ring_width_px:36,
   min_ring_contrast:0.05,
   max_candidates:200,
@@ -18,6 +20,10 @@ const DEFAULT_CIC_PARAMS = {
   homotypic_min_coverage:0.88,
   homotypic_host_max_circularity:0.78,
   host_max_distance_px:150,
+  min_host_separation_factor:0.58,
+  host_radius_allowance:1.8,
+  max_inner_host_area_ratio:1.5,
+  max_inner_radius_factor:1.8,
 };
 function defaultParams(target) {
   return {
@@ -423,7 +429,8 @@ function drawCicOverlay(target=$("overlayCanvas")) {
     }
     context.restore();
     if (!state.showLabels) continue;
-    const prefix=event.classification==="heterotypic"?"异":event.classification==="homotypic"?"同":event.type_hint==="homotypic"?"同?":"异?";
+    const grade=event.evidence_grade||"";
+    const prefix=event.classification==="heterotypic"?"异":event.classification==="homotypic"?"同":event.type_hint==="homotypic"?"同?":`异${grade}?`;
     context.font="700 16px system-ui";context.textAlign="center";context.textBaseline="middle";
     context.lineWidth=4;context.strokeStyle="rgba(0,0,0,.9)";context.fillStyle="#fff";
     const label=`${prefix}${index}`;
@@ -515,13 +522,25 @@ const cicFieldMap={
 function populateCicParameters(params={}) {
   const merged={...DEFAULT_CIC_PARAMS,...params};
   Object.entries(cicFieldMap).forEach(([id,key])=>$(id).value=merged[key]);
+  $("cicEvidenceProfile").value=merged.evidence_profile;
   $("cicHomotypicEnabled").checked=Boolean(merged.homotypic_enabled);
 }
 function collectCicParameters() {
   const params={...DEFAULT_CIC_PARAMS,...state.project.cic_parameters_by_group[state.currentGroup]};
   Object.entries(cicFieldMap).forEach(([id,key])=>params[key]=Number($(id).value));
+  params.evidence_profile=$("cicEvidenceProfile").value;
+  params.rule_version=3;
   params.homotypic_enabled=$("cicHomotypicEnabled").checked;
   return params;
+}
+function applyCicPptPreset() {
+  if(!state.currentGroup)return;
+  $("cicEvidenceProfile").value="ppt_annotated";
+  $("cicMinCoverage").value="0.55";
+  $("cicRingWidth").value="36";
+  $("cicMinContrast").value="0.05";
+  const params=saveCicParameters(false);
+  if(params)toast("已应用 CIC 标注 PPT 推荐参数；同质 CIC 规则保持保守");
 }
 function saveCicParameters(all=false) {
   if (!state.currentGroup) return null;
@@ -657,7 +676,9 @@ async function analyzeScope(scope) {
 function compactDetections(detections=[]) {
   return detections.filter(item=>!item.deleted).map(item=>({
     id:item.id,x:item.x,y:item.y,radius:item.radius||12,area_px:item.area_px||0,
-    circularity:Number.isFinite(item.circularity)?item.circularity:1,manual:Boolean(item.manual)
+    circularity:Number.isFinite(item.circularity)?item.circularity:1,
+    positive_fraction:item.positive_fraction==null?null:Number(item.positive_fraction),
+    anchor_manual:Boolean(item.anchor_manual),manual:Boolean(item.manual)
   }));
 }
 function analyzeCicOne(view,params) {
@@ -859,7 +880,7 @@ function handleCicCanvasClick(event) {
   const selected=cicEventAtPoint(point);
   state.selectedCicId=selected?.id||null;
   $("cicSelectionHint").textContent=selected
-    ? `${selected.id} · 自动提示 ${selected.type_hint==="homotypic"?"同质":"异质"} · 包围比例 ${Number(selected.enclosure_coverage||0).toFixed(2)}`
+    ? `${selected.id} · ${selected.evidence_grade?`${selected.evidence_grade} 级 · `:""}自动提示 ${selected.type_hint==="homotypic"?"同质":"异质"} · 包围 ${Number(selected.enclosure_coverage||0).toFixed(2)} · 对侧 ${selected.opposite_pairs??"—"}/8 · 象限 ${selected.quadrant_count??"—"}/4 · 径向 ${Number(selected.radial_coherence||0).toFixed(2)}`
     :"未选中 CIC 候选";
   drawCicOverlay();
 }
@@ -1158,7 +1179,7 @@ async function cicAnnotatedBlob(view) {
     context.beginPath();context.arc(event.x,event.y,inner,0,Math.PI*2);context.stroke();
     context.globalAlpha=.8;context.beginPath();context.arc(event.x,event.y,outer,0,Math.PI*2);context.stroke();
     context.restore();
-    const prefix=event.classification==="heterotypic"?"异":event.classification==="homotypic"?"同":"待";
+    const prefix=event.classification==="heterotypic"?"异":event.classification==="homotypic"?"同":`待${event.evidence_grade||""}`;
     context.font="700 18px system-ui";context.textAlign="center";context.textBaseline="middle";
     context.lineWidth=4;context.strokeStyle="rgba(0,0,0,.9)";context.fillStyle="#fff";
     context.strokeText(`${prefix}${index+1}`,event.x,event.y-outer-13);
@@ -1227,17 +1248,25 @@ function cellRawCsv(views=state.project.views) {
   return csvEncode(rows);
 }
 function cicRawCsv(views=state.project.views) {
-  const rows=[["实验组","视野","CIC编号","最终分类","自动提示","内部细胞类型","外部细胞类型","内部细胞编号","外部细胞编号","X_px","Y_px","包围比例","环内差异","置信分","来源","已人工复核","人工修正","已删除"]];
+  const rows=[["实验组","视野","CIC编号","最终分类","自动提示","证据等级","判定规则","内部细胞类型","外部细胞类型","内部细胞编号","外部细胞编号","X_px","Y_px","包围比例","环内差异","对侧支持数_8","覆盖象限数_4","最大连续缺口_16","径向一致性","近层覆盖","远层覆盖","宿主核距离_px","内外细胞面积比","内部NK半径相对中位数","内部绿色阳性比例","置信分","来源","已人工复核","人工修正","已删除"]];
   for(const view of views){
     for(const event of cicResult(view.id)?.events||[]){
       const innerType=TARGETS.includes(event.inner_cell_type)?targetLabel(event.inner_cell_type):event.inner_cell_type;
       const outerType=TARGETS.includes(event.outer_cell_type)?targetLabel(event.outer_cell_type):event.outer_cell_type;
       rows.push([
-        view.group,view.name,event.id,event.classification,event.type_hint,
+        view.group,view.name,event.id,event.classification,event.type_hint,event.evidence_grade,event.evidence_rule,
         innerType,outerType,event.inner_cell_id,event.outer_cell_id,
         Number(event.x).toFixed(2),Number(event.y).toFixed(2),
         event.enclosure_coverage==null?"":Number(event.enclosure_coverage).toFixed(4),
         event.ring_contrast==null?"":Number(event.ring_contrast).toFixed(4),
+        event.opposite_pairs??"",event.quadrant_count??"",event.largest_gap_sectors??"",
+        event.radial_coherence==null?"":Number(event.radial_coherence).toFixed(4),
+        event.near_coverage==null?"":Number(event.near_coverage).toFixed(4),
+        event.far_coverage==null?"":Number(event.far_coverage).toFixed(4),
+        event.host_distance_px==null?"":Number(event.host_distance_px).toFixed(2),
+        event.inner_host_area_ratio==null?"":Number(event.inner_host_area_ratio).toFixed(4),
+        event.inner_radius_typical_ratio==null?"":Number(event.inner_radius_typical_ratio).toFixed(4),
+        event.inner_positive_fraction==null?"":Number(event.inner_positive_fraction).toFixed(4),
         event.confidence==null?"":Number(event.confidence).toFixed(4),
         event.source,Boolean(event.reviewed),Boolean(event.manual),Boolean(event.deleted)
       ]);
@@ -1547,7 +1576,7 @@ async function reviewNextPendingCic() {
     state.panX=viewer.clientWidth/2-state.fitLeft-event.x*(stage.clientWidth/$("overlayCanvas").width)*state.zoom;
     state.panY=viewer.clientHeight/2-state.fitTop-event.y*(stage.clientHeight/$("overlayCanvas").height)*state.zoom;
     applyViewportTransform();
-    $("cicSelectionHint").textContent=`待复核 ${event.id} · 自动提示 ${event.type_hint==="homotypic"?"同质":"异质"}`;
+    $("cicSelectionHint").textContent=`待复核 ${event.id} · ${event.evidence_grade?`${event.evidence_grade} 级 · `:""}自动提示 ${event.type_hint==="homotypic"?"同质":"异质"} · 包围 ${Number(event.enclosure_coverage||0).toFixed(2)} · 对侧 ${event.opposite_pairs??"—"}/8`;
     return;
   }
   toast("当前项目没有待复核 CIC 候选");
@@ -1731,7 +1760,7 @@ function drawCompareCic(canvas,events=[]) {
     if(state.showLabels){
       context.font="700 15px system-ui";context.textAlign="center";context.lineWidth=3;
       context.strokeStyle="#05070a";context.fillStyle="#fff";
-      const prefix=event.classification==="heterotypic"?"异":event.classification==="homotypic"?"同":"?";
+      const prefix=event.classification==="heterotypic"?"异":event.classification==="homotypic"?"同":`${event.evidence_grade||""}?`;
       context.strokeText(`${prefix}${index}`,event.x,event.y-outer-10);context.fillText(`${prefix}${index}`,event.x,event.y-outer-10);
     }
   }
@@ -1853,6 +1882,7 @@ $("analyzeCicCurrentBtn").onclick=()=>analyzeCicScope("current");
 $("analyzeCicGroupBtn").onclick=()=>analyzeCicScope("group");
 $("analyzeCicAllBtn").onclick=()=>analyzeCicScope("all");
 $("reviewPendingCicBtn").onclick=reviewNextPendingCic;
+$("cicPptPresetBtn").onclick=applyCicPptPreset;
 document.querySelectorAll("#channelTabs button").forEach(button=>button.onclick=async()=>{
   if(button.dataset.channel==="cic"){await activateCicReview();return;}
   if (TARGETS.includes(button.dataset.channel)) {

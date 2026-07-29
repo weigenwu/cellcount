@@ -78,6 +78,7 @@ let browser, page;
   assert.strictEqual(await page.evaluate(()=>state.detections[0].deleted),false);
   await page.locator("#redoBtn").click();
   assert.strictEqual(await page.evaluate(()=>state.detections[0].deleted),true);
+  assert.strictEqual(await page.evaluate(()=>cicRawCsv().includes("证据等级")&&cicRawCsv().includes("径向一致性")),true);
   assert.deepStrictEqual(errors,[]);
   await browser.close();
   server.close();

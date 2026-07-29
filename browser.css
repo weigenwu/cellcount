@@ -75,6 +75,7 @@
 .cic-actions { flex-wrap: wrap; justify-content: flex-end; }
 .cic-panel { margin-top: 14px; border: 1px solid #4a3921; border-radius: 10px; padding: 11px; background: #111720; }
 .cic-panel summary { color: #ffe0a0; }
+.cic-ppt-preset { margin: 8px 0 4px; border-color: #66512b; color: #ffdfa0; background: #211a10; }
 .check-field { display: flex !important; align-items: center; gap: 7px; line-height: 1.4; }
 .check-field input { display: inline-block !important; width: auto !important; margin: 0 !important; }
 .cic-count-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 10px; }
