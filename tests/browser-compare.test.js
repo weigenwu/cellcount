@@ -43,6 +43,18 @@ let browser, page;
   const errors=[];
   page.on("console",message=>message.type()==="error"&&errors.push(message.text()));
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
+  assert.strictEqual(await page.locator(".welcome h1").textContent(),"荧光细胞计数与 CIC 复核");
+  assert.strictEqual(await page.locator(".biology-legend span").count(),3);
+  assert.strictEqual(await page.locator(".capability-rail span").count(),4);
+  assert.strictEqual(await page.locator(".welcome-micrograph").getAttribute("src"),"static/assets/cellscope-fluorescence-hero.png");
+  assert.strictEqual(await page.locator(".welcome-micrograph").evaluate(image=>image.complete&&image.naturalWidth>0),true);
+  if(process.env.CELLSCOPE_LANDING_SCREENSHOT)await page.screenshot({path:process.env.CELLSCOPE_LANDING_SCREENSHOT,fullPage:true});
+  if(process.env.CELLSCOPE_LANDING_MOBILE_SCREENSHOT){
+    await page.setViewportSize({width:390,height:844});
+    assert.strictEqual(await page.evaluate(()=>document.documentElement.scrollWidth<=document.documentElement.clientWidth),true);
+    await page.screenshot({path:process.env.CELLSCOPE_LANDING_MOBILE_SCREENSHOT,fullPage:true});
+    await page.setViewportSize({width:1500,height:900});
+  }
   await page.locator("#folderInput").setInputFiles(experiment);
   await page.waitForTimeout(800);
   assert.match(await page.locator("#projectMeta").textContent(),/2 个视野/);

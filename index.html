@@ -7,8 +7,8 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; worker-src 'self' blob:; connect-src 'self'">
   <title>CellScope · 浏览器细胞计数</title>
   <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="static/styles.css">
-  <link rel="stylesheet" href="browser.css?v=20260729-navfix1">
+  <link rel="stylesheet" href="static/styles.css?v=20260729-hero1">
+  <link rel="stylesheet" href="browser.css?v=20260729-hero1">
 </head>
 <body>
   <header class="topbar">
@@ -25,25 +25,34 @@
 
   <main id="appShell" class="app-shell empty">
     <section id="welcome" class="welcome">
-      <div class="welcome-glow"></div>
-      <div class="eyebrow">ZERO-UPLOAD FLUORESCENCE WORKBENCH</div>
-      <h1>打开网页，选择文件夹，<br><em>直接开始细胞计数。</em></h1>
-      <p>无需安装软件。DAPI、NK 和肿瘤通道仅在你的浏览器中读取与分析，不会上传到服务器。</p>
-      <div class="welcome-actions">
-        <label class="button primary large file-button">选择 Leica 图片文件夹<input id="welcomeFolderInput" type="file" webkitdirectory multiple accept=".tif,.tiff,.png,.jpg,.jpeg,.xml"></label>
-        <button class="button ghost large" id="mappingToggleBtn">自定义通道后缀</button>
+      <img class="welcome-micrograph" src="static/assets/cellscope-fluorescence-hero.png" alt="" aria-hidden="true">
+      <div class="welcome-content">
+        <div class="eyebrow">LOCAL FLUORESCENCE ANALYSIS</div>
+        <div class="biology-legend" aria-label="默认荧光通道">
+          <span><i class="blue"></i>DAPI 细胞核</span>
+          <span><i class="green"></i>NK 细胞</span>
+          <span><i class="red"></i>肿瘤细胞</span>
+        </div>
+        <h1>荧光细胞计数<br><em>与 CIC 复核</em></h1>
+        <p>批量识别 · 分通道校准 · 人工修正 · 标注图导出</p>
+        <div class="welcome-actions">
+          <label class="button primary large file-button">选择实验文件夹<input id="welcomeFolderInput" type="file" webkitdirectory multiple accept=".tif,.tiff,.png,.jpg,.jpeg,.xml"></label>
+          <button class="welcome-link" id="mappingToggleBtn">自定义通道后缀</button>
+        </div>
+        <div class="local-assurance"><span></span><strong>仅在本机分析</strong>原始图片不上传</div>
       </div>
       <div id="mappingPanel" class="mapping-panel hidden">
         <label><span class="dot blue"></span>DAPI 后缀<input id="suffixDapi" value="_ch00"></label>
         <label><span class="dot green"></span>NK 后缀<input id="suffixNk" value="_ch01"></label>
         <label><span class="dot red"></span>肿瘤后缀<input id="suffixTumor" value="_ch02"></label>
       </div>
-      <div class="browser-notes">
-        <span><b>01</b>选择整个实验文件夹</span>
-        <span><b>02</b>校准每组参数</span>
-        <span><b>03</b>逐张或批量分析</span>
-        <span><b>04</b>人工复核并导出</span>
+      <div class="capability-rail" aria-label="分析流程">
+        <span><b>01</b><i>批量读取</i><small>实验文件夹</small></span>
+        <span><b>02</b><i>三通道计数</i><small>独立阈值</small></span>
+        <span><b>03</b><i>CIC 复核</i><small>同质与异质</small></span>
+        <span><b>04</b><i>结果导出</i><small>数据与标注图</small></span>
       </div>
+      <small class="hero-image-note">示意性荧光背景 · 非实验数据</small>
     </section>
 
     <aside id="sidebar" class="sidebar hidden">
@@ -306,6 +315,6 @@
     <footer class="compare-help">滚轮缩放 · 左键拖拽 · 双击适应窗口；同步模式按相同图像坐标对齐，适合比较同尺寸视野。</footer>
   </section>
   <script src="static/vendor/UTIF.min.js"></script>
-  <script src="browser-app.js?v=20260729-navfix1"></script>
+  <script src="browser-app.js?v=20260729-hero1"></script>
 </body>
 </html>
