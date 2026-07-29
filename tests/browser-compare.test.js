@@ -46,6 +46,15 @@ let browser, page;
   await page.locator("#folderInput").setInputFiles(experiment);
   await page.waitForTimeout(800);
   assert.match(await page.locator("#projectMeta").textContent(),/2 个视野/);
+  assert.strictEqual(await page.locator("#cicPanel").evaluate(node=>node.open),false);
+  assert.strictEqual(await page.locator("#analyzeCicCurrentBtn").isDisabled(),true);
+  assert.strictEqual(await page.locator("#cicPrerequisiteBadge").textContent(),"当前视野 0/3");
+  const workflowOrder=await page.evaluate(()=>({
+    cells:document.querySelector("#analyzeCurrentBtn").getBoundingClientRect().top,
+    cic:document.querySelector("#cicPanel").getBoundingClientRect().top,
+  }));
+  assert(workflowOrder.cells<workflowOrder.cic);
+  if(process.env.CELLSCOPE_WORKFLOW_SCREENSHOT)await page.screenshot({path:process.env.CELLSCOPE_WORKFLOW_SCREENSHOT,fullPage:true});
   await page.locator("#compareBtn").click();
   await page.locator("#compareDialog:not(.hidden)").waitFor();
   assert.strictEqual(await page.locator("#compareLeftView option").count(), 2);
@@ -78,6 +87,13 @@ let browser, page;
   assert.strictEqual(await page.evaluate(()=>state.detections[0].deleted),false);
   await page.locator("#redoBtn").click();
   assert.strictEqual(await page.evaluate(()=>state.detections[0].deleted),true);
+  await page.evaluate(()=>{
+    state.project.results[state.currentViewId].nk={status:"done",error:"",detections:[]};
+    state.project.results[state.currentViewId].tumor={status:"done",error:"",detections:[]};
+    updateCounts();
+  });
+  assert.strictEqual(await page.locator("#cicPrerequisiteBadge").textContent(),"三类计数已完成");
+  assert.strictEqual(await page.locator("#analyzeCicCurrentBtn").isEnabled(),true);
   assert.strictEqual(await page.evaluate(()=>cicRawCsv().includes("证据等级")&&cicRawCsv().includes("径向一致性")),true);
   assert.deepStrictEqual(errors,[]);
   await browser.close();

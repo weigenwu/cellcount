@@ -208,9 +208,22 @@
         <article class="tumor"><span id="countLabelTumor">肿瘤 总数</span><strong id="countTumor">—</strong></article>
         <article class="review"><span>当前计数对象</span><strong id="currentTargetName">DAPI</strong></article>
       </div>
-      <details id="cicPanel" class="cic-panel" open>
-        <summary><span class="dot amber"></span>CIC 候选筛查与复核</summary>
-        <p class="parameter-note">先完成 DAPI、NK、肿瘤计数。自动结果只作为二维候选，必须人工确认后才计入同质或异质 CIC。</p>
+      <div class="batch-actions">
+        <button class="button primary" id="analyzeCurrentBtn">预跑当前图片</button>
+        <button class="button ghost" id="analyzeGroupBtn">批量当前组</button>
+        <button class="button ghost full" id="analyzeAllBtn">批量全部视野（当前类别）</button>
+        <button class="button ghost full" id="resumeBtn">继续当前类别未完成视野</button>
+      </div>
+      <div id="jobPanel" class="job-panel hidden">
+        <div><span id="jobTitle">正在分析</span><b id="jobPercent">0%</b></div>
+        <div class="progress"><i id="jobProgress"></i></div>
+        <p id="jobCurrent">准备中…</p>
+        <button id="cancelBtn">停止批处理</button>
+      </div>
+      <p id="calibrationWarning" class="calibration-warning">推荐顺序：选择 DAPI → 随机预跑 → 保存阈值 → 批量；然后对 NK、肿瘤分别重复。三类参数互不覆盖。</p>
+      <details id="cicPanel" class="cic-panel">
+        <summary><span><span class="dot amber"></span>CIC 候选筛查与复核</span><small id="cicPrerequisiteBadge">当前视野 0/3</small></summary>
+        <p class="parameter-note cic-workflow-note">仅在完成 DAPI、NK、肿瘤三类计数后使用。自动结果只作为二维候选，必须人工确认后才计入同质或异质 CIC。</p>
         <div class="fields">
           <label class="full">异质 CIC 判定策略<select id="cicEvidenceProfile"><option value="ppt_annotated">标注 PPT 增强判定（推荐）</option><option value="strict_complete">仅完整包围（更保守）</option></select></label>
           <label>最小包围比例<input id="cicMinCoverage" type="number" min="0.25" max="1" step="0.01" value="0.55"></label>
@@ -234,19 +247,6 @@
           <button class="button ghost full" id="reviewPendingCicBtn">跳到下一个待复核候选</button>
         </div>
       </details>
-      <div class="batch-actions">
-        <button class="button primary" id="analyzeCurrentBtn">预跑当前图片</button>
-        <button class="button ghost" id="analyzeGroupBtn">批量当前组</button>
-        <button class="button ghost full" id="analyzeAllBtn">批量全部视野（当前类别）</button>
-        <button class="button ghost full" id="resumeBtn">继续当前类别未完成视野</button>
-      </div>
-      <div id="jobPanel" class="job-panel hidden">
-        <div><span id="jobTitle">正在分析</span><b id="jobPercent">0%</b></div>
-        <div class="progress"><i id="jobProgress"></i></div>
-        <p id="jobCurrent">准备中…</p>
-        <button id="cancelBtn">停止批处理</button>
-      </div>
-      <p id="calibrationWarning" class="calibration-warning">推荐顺序：选择 DAPI → 随机预跑 → 保存阈值 → 批量；然后对 NK、肿瘤分别重复。三类参数互不覆盖。</p>
     </aside>
   </main>
 

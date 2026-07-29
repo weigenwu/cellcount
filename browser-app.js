@@ -249,6 +249,7 @@ function renderGroups() {
 }
 function updateSelectedGroupCount() {
   $("selectedGroupCount").textContent=`${state.selectedGroups.size} / ${state.project?.groups.length||0} 个已选`;
+  updateCicPrerequisiteUi();
 }
 
 async function selectView(id) {
@@ -706,6 +707,32 @@ function analyzeCicOne(view,params) {
 function cicPrerequisitesReady(view) {
   return TARGETS.every(target=>targetStatus(view.id,target)==="done");
 }
+function updateCicPrerequisiteUi() {
+  if(!state.project||!$("cicPrerequisiteBadge"))return;
+  const current=state.currentViewId?viewById(state.currentViewId):null;
+  const currentDone=current?TARGETS.filter(target=>targetStatus(current.id,target)==="done").length:0;
+  const currentReady=Boolean(current&&cicPrerequisitesReady(current));
+  const currentGroupViews=state.currentGroup?groupViews(state.currentGroup).filter(view=>!view.error):[];
+  const groupReady=currentGroupViews.length>0&&currentGroupViews.every(cicPrerequisitesReady);
+  const selectedViews=state.project.views.filter(view=>state.selectedGroups.has(view.group)&&!view.error);
+  const selectedReady=selectedViews.filter(cicPrerequisitesReady).length;
+  const allSelectedReady=selectedViews.length>0&&selectedReady===selectedViews.length;
+  const badge=$("cicPrerequisiteBadge");
+  badge.textContent=currentReady
+    ? (cicStatus()==="done"?"当前视野已筛查":"三类计数已完成")
+    : `当前视野 ${currentDone}/3`;
+  badge.title=`已选文件夹中 ${selectedReady}/${selectedViews.length} 个视野完成三类计数`;
+  badge.classList.toggle("ready",currentReady);
+  $("cicPanel").classList.toggle("ready",currentReady);
+  $("analyzeCicCurrentBtn").disabled=!currentReady;
+  $("analyzeCicGroupBtn").disabled=!groupReady;
+  $("analyzeCicAllBtn").disabled=!allSelectedReady;
+  const hasPending=state.project.views.some(view=>(cicResult(view.id)?.events||[]).some(event=>!event.deleted&&event.classification==="pending"));
+  $("reviewPendingCicBtn").disabled=!hasPending;
+  $("analyzeCicCurrentBtn").title=currentReady?"":"请先完成当前视野的三类细胞计数";
+  $("analyzeCicGroupBtn").title=groupReady?"":"请先完成当前实验组全部视野的三类细胞计数";
+  $("analyzeCicAllBtn").title=allSelectedReady?"":`已选文件夹完成 ${selectedReady}/${selectedViews.length} 个视野`;
+}
 async function analyzeCicScope(scope) {
   if (!state.project||state.busy) return;
   const params=saveCicParameters(false);
@@ -793,6 +820,7 @@ function updateCounts() {
   $("countCicStatus").textContent=cicStatusLabels[cicStatus()]||cicStatus();
   $("currentTargetName").textContent=targetLabel(state.target);
   updateActionLabels();
+  updateCicPrerequisiteUi();
 }
 function updateActionLabels() {
   if (!state.project) return;

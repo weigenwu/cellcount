@@ -74,7 +74,13 @@
 .channel-tabs button.cic-tab.active { color: #ffe09a; background: #3a2b17; }
 .cic-actions { flex-wrap: wrap; justify-content: flex-end; }
 .cic-panel { margin-top: 14px; border: 1px solid #4a3921; border-radius: 10px; padding: 11px; background: #111720; }
-.cic-panel summary { color: #ffe0a0; }
+.cic-panel summary { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #ffe0a0; }
+.cic-panel summary > span { min-width: 0; }
+.cic-panel summary small { flex: 0 0 auto; padding: 3px 6px; border: 1px solid #4c4333; border-radius: 999px; color: #9b8c70; font-size: 8px; font-weight: 600; }
+.cic-panel summary small.ready { border-color: #2c7355; color: #72e4ad; background: #11271f; }
+.cic-panel.ready { border-color: #356249; }
+.cic-panel button:disabled { cursor: not-allowed; opacity: .38; filter: saturate(.35); }
+.cic-workflow-note { color: #9ba9ba; }
 .cic-ppt-preset { margin: 8px 0 4px; border-color: #66512b; color: #ffdfa0; background: #211a10; }
 .check-field { display: flex !important; align-items: center; gap: 7px; line-height: 1.4; }
 .check-field input { display: inline-block !important; width: auto !important; margin: 0 !important; }
