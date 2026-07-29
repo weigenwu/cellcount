@@ -1,4 +1,5 @@
 /* global UTIF */
+const APP_ASSET_VERSION = "20260729-navfix1";
 const DEFAULTS = {
   threshold_mode: "manual", threshold_low: 15, threshold_high: 255,
   gaussian_sigma: 1, opening_radius: 1, watershed_min_distance: 12,
@@ -581,7 +582,7 @@ function saveCicParameters(all=false) {
 
 function createWorker() {
   if (state.worker) state.worker.terminate();
-  state.worker = new Worker("browser-worker.js");
+  state.worker = new Worker(`browser-worker.js?v=${APP_ASSET_VERSION}`);
   return state.worker;
 }
 function analyzeOne(view, params, target) {
