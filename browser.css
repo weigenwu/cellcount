@@ -38,6 +38,16 @@
 .viewer.pan-ready, .viewer.pan-ready .image-stage { cursor: grab; }
 .viewer.is-panning, .viewer.is-panning .image-stage { cursor: grabbing; }
 .viewer.is-panning canvas { pointer-events: none; }
+.viewer-nav { position: absolute; top: 50%; z-index: 5; display: flex; align-items: center; gap: 5px; min-width: 38px; min-height: 54px; padding: 8px 7px; border: 1px solid #334055; border-radius: 9px; background: rgba(13,19,28,.88); color: #d7e0ec; cursor: pointer; transform: translateY(-50%); backdrop-filter: blur(8px); opacity: .68; transition: opacity .15s,border-color .15s,background .15s; }
+.viewer-nav:hover { opacity: 1; border-color: #6781d2; background: rgba(25,35,52,.95); }
+.viewer-nav.previous { left: 12px; }
+.viewer-nav.next { right: 12px; }
+.viewer-nav b { font-size: 25px; line-height: 1; font-weight: 400; }
+.viewer-nav span { display: none; font-size: 9px; white-space: nowrap; }
+.viewer-nav:hover span { display: inline; }
+.viewer-nav:disabled { cursor: not-allowed; opacity: .18; border-color: #28313f; }
+.viewer-nav:disabled span { display: none; }
+.view-position-badge { position: absolute; z-index: 5; top: 12px; left: 50%; padding: 4px 8px; border: 1px solid #2c3747; border-radius: 999px; background: rgba(8,12,18,.78); color: #8f9eb1; font-size: 9px; transform: translateX(-50%); pointer-events: none; backdrop-filter: blur(8px); }
 .compare-button { border-color: #40558c; color: #b9c7ff; }
 .autosave-status { min-width: 62px; color: #65758b; font-size: 8px; text-align: right; }
 .autosave-status.saving { color: #ffca68; }

@@ -207,6 +207,26 @@ function openWorkspace() {
 }
 function groupViews(group) { return state.project.views.filter(view => view.group === group); }
 function viewById(id) { return state.project.views.find(view => view.id === id); }
+function updateViewNavigation() {
+  if(!state.project||!state.currentViewId)return;
+  const current=viewById(state.currentViewId);
+  const views=current?groupViews(current.group):[];
+  const index=views.findIndex(view=>view.id===state.currentViewId);
+  const previous=views[index-1],next=views[index+1];
+  $("previousViewBtn").disabled=!previous;
+  $("nextViewBtn").disabled=!next;
+  $("previousViewBtn").title=previous?`上一张：${previous.name}（键盘 ←）`:"已经是当前文件夹第一张";
+  $("nextViewBtn").title=next?`下一张：${next.name}（键盘 →）`:"已经是当前文件夹最后一张";
+  $("viewPositionBadge").textContent=index>=0?`${index+1} / ${views.length}`:`0 / ${views.length}`;
+  $("viewPositionBadge").title=current?current.group:"";
+}
+async function navigateCurrentGroup(offset) {
+  if(!state.project||!state.currentViewId||state.busy)return;
+  const current=viewById(state.currentViewId),views=groupViews(current.group);
+  const index=views.findIndex(view=>view.id===current.id);
+  const target=views[index+offset];
+  if(target)await selectView(target.id);
+}
 function targetResult(viewId, target=state.target) { return state.project.results[viewId]?.[target]; }
 function targetStatus(viewId, target) { return targetResult(viewId,target)?.status || "pending"; }
 function cicResult(viewId=state.currentViewId) { return state.project?.results?.[viewId]?.cic; }
@@ -264,6 +284,7 @@ async function selectView(id) {
   state.cicEvents = cicResult(id)?.events || [];
   populateCicParameters(state.project.cic_parameters_by_group[view.group]);
   updateCounts();
+  updateViewNavigation();
   renderGroups();
   await showImage();
 }
@@ -1942,6 +1963,8 @@ $("zoomInBtn").onclick=()=>setZoom(state.zoom+.25);
 $("zoomOutBtn").onclick=()=>setZoom(state.zoom-.25);
 $("fitBtn").onclick=fitCurrentStage;
 $("centerBtn").onclick=centerStage;
+$("previousViewBtn").onclick=()=>navigateCurrentGroup(-1);
+$("nextViewBtn").onclick=()=>navigateCurrentGroup(1);
 $("undoBtn").onclick=undoCorrection;
 $("redoBtn").onclick=redoCorrection;
 $("compareBtn").onclick=openCompare;
@@ -1976,6 +1999,12 @@ $("viewer").addEventListener("pointercancel",endPan);
 $("viewer").addEventListener("auxclick",event=>{if(event.button===1)event.preventDefault();});
 window.addEventListener("keydown",event=>{
   if(event.key==="Escape"&&compareState.open){closeCompare();return;}
+  if(!compareState.open&&!isTypingTarget(event.target)&&!event.ctrlKey&&!event.metaKey&&!event.altKey
+    &&(event.key==="ArrowLeft"||event.key==="ArrowRight")){
+    event.preventDefault();
+    navigateCurrentGroup(event.key==="ArrowLeft"?-1:1);
+    return;
+  }
   if((event.ctrlKey||event.metaKey)&&!isTypingTarget(event.target)&&event.key.toLowerCase()==="z"){
     event.preventDefault();event.shiftKey?redoCorrection():undoCorrection();return;
   }

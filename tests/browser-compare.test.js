@@ -49,6 +49,17 @@ let browser, page;
   assert.strictEqual(await page.locator("#cicPanel").evaluate(node=>node.open),false);
   assert.strictEqual(await page.locator("#analyzeCicCurrentBtn").isDisabled(),true);
   assert.strictEqual(await page.locator("#cicPrerequisiteBadge").textContent(),"当前视野 0/3");
+  assert.strictEqual(await page.locator("#viewPositionBadge").textContent(),"1 / 2");
+  assert.strictEqual(await page.locator("#previousViewBtn").isDisabled(),true);
+  assert.strictEqual(await page.locator("#nextViewBtn").isEnabled(),true);
+  await page.locator('#channelTabs button[data-channel="dapi"]').click();
+  await page.locator("#nextViewBtn").click();
+  await page.waitForFunction(()=>document.querySelector("#currentViewLabel").textContent==="Overlay002");
+  assert.strictEqual(await page.locator("#viewPositionBadge").textContent(),"2 / 2");
+  assert.strictEqual(await page.locator('#channelTabs button[data-channel="dapi"]').getAttribute("class"),"active");
+  await page.keyboard.press("ArrowLeft");
+  await page.waitForFunction(()=>document.querySelector("#currentViewLabel").textContent==="Overlay001");
+  assert.strictEqual(await page.evaluate(()=>state.channel),"dapi");
   const workflowOrder=await page.evaluate(()=>({
     cells:document.querySelector("#analyzeCurrentBtn").getBoundingClientRect().top,
     cic:document.querySelector("#cicPanel").getBoundingClientRect().top,
