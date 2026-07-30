@@ -485,13 +485,50 @@ function cicConfidence(metrics,hostDistance,params,type,grade="A",areaRatio=1) {
   const gradeBase=grade==="A"?.48:.39;
   return Math.min(.99,gradeBase+.17*coverageScore+.13*contrastScore+.1*proximityScore+.09*morphologyScore+.04*sizeScore);
 }
+function cicLearningVector(event) {
+  const clamp=value=>Math.max(0,Math.min(1,Number(value)||0));
+  const required=[
+    "enclosure_coverage","ring_contrast","opposite_pairs","quadrant_count",
+    "largest_gap_sectors","radial_coherence","near_coverage","far_coverage",
+    "host_distance_px","inner_host_area_ratio","inner_radius_typical_ratio"
+  ];
+  if(required.some(key=>event[key]==null||!Number.isFinite(Number(event[key]))))return null;
+  return [
+    clamp(event.enclosure_coverage),
+    clamp((Number(event.ring_contrast)+.25)/.75),
+    clamp(Number(event.opposite_pairs)/8),
+    clamp(Number(event.quadrant_count)/4),
+    clamp(1-Number(event.largest_gap_sectors)/16),
+    clamp(event.radial_coherence),
+    clamp(event.near_coverage),
+    clamp(event.far_coverage),
+    clamp(1-Number(event.host_distance_px)/180),
+    clamp(1-Number(event.inner_host_area_ratio)/2),
+    clamp(1-Math.abs(Number(event.inner_radius_typical_ratio)-1)/1.5),
+  ];
+}
+function cicLearningScore(event,model) {
+  if(!model?.active||!Array.isArray(model.samples))return null;
+  const vector=cicLearningVector(event);
+  if(!vector)return null;
+  const distances=model.samples.map(sample=>{
+    const distance=Math.sqrt(vector.reduce((sum,value,index)=>sum+(value-Number(sample.vector[index]||0))**2,0));
+    return{distance,label:Number(sample.label)===1?1:0};
+  }).sort((a,b)=>a.distance-b.distance).slice(0,Math.min(7,model.samples.length));
+  let positive=0,total=0;
+  for(const item of distances){
+    const weight=1/(item.distance+.08);
+    positive+=weight*item.label;total+=weight;
+  }
+  return total?positive/total:null;
+}
 function median(values) {
   if(!values.length)return 0;
   const sorted=[...values].sort((a,b)=>a-b);
   const middle=Math.floor(sorted.length/2);
   return sorted.length%2?sorted[middle]:(sorted[middle-1]+sorted[middle])/2;
 }
-function analyzeCicCandidates(red,width,height,nkDetections,tumorDetections,params) {
+function analyzeCicCandidates(red,width,height,nkDetections,tumorDetections,params,learningModel={}) {
   const redThreshold=Math.max(12,histogramQuantile(red,Number(params.red_quantile)||.72));
   const events=[];
   const typicalNkRadius=median(nkDetections.map(item=>Number(item.radius)||0).filter(value=>value>0));
@@ -500,13 +537,13 @@ function analyzeCicCandidates(red,width,height,nkDetections,tumorDetections,para
     if(!inner.manual&&innerSizeRatio>Math.max(1.2,Number(params.max_inner_radius_factor)||1.8))continue;
     const metrics=enclosureMetrics(red,width,height,inner,params,redThreshold);
     const evidence=heterotypicEvidence(metrics,params);
-    if(!evidence.pass)continue;
+    if(!evidence.pass&&(metrics.coverage<.15||metrics.quadrantCount<2||metrics.radialCoherence<.08))continue;
     const host=nearestHostDetection(inner,tumorDetections,metrics,params);
     if(!host)continue;
     const areaRatio=(Number(inner.area_px)||Math.PI*(inner.radius||12)**2)
       /Math.max(1,Number(host.item.area_px)||Math.PI*(host.item.radius||12)**2);
     if(areaRatio>Math.max(1,Number(params.max_inner_host_area_ratio)||1.5))continue;
-    events.push({
+    const candidate={
       id:`cic-auto-hetero-${events.length+1}`,
       x:inner.x,y:inner.y,inner_radius:metrics.innerRadius,outer_radius:metrics.outerRadius,
       outer_x:host.item.x,outer_y:host.item.y,
@@ -523,16 +560,27 @@ function analyzeCicCandidates(red,width,height,nkDetections,tumorDetections,para
       inner_positive_fraction:Number(inner.positive_fraction)||null,
       confidence:cicConfidence(metrics,host.distance,params,"heterotypic",evidence.grade,areaRatio),
       red_threshold:redThreshold,source:"automatic_2d_candidate",manual:false,reviewed:false,deleted:false,
-    });
+    };
+    candidate.learning_score=cicLearningScore(candidate,learningModel.heterotypic);
+    if(!evidence.pass&&(candidate.learning_score==null||candidate.learning_score<.62))continue;
+    if(!evidence.pass){
+      candidate.evidence_grade="L";
+      candidate.evidence_rule="local_learning_recovered_candidate";
+      candidate.confidence=Math.max(candidate.confidence,candidate.learning_score);
+    }
+    events.push(candidate);
   }
   if(params.homotypic_enabled){
     const pairs=new Map();
     for(const inner of tumorDetections){
       const metrics=enclosureMetrics(red,width,height,inner,params,redThreshold);
-      if(metrics.coverage<params.homotypic_min_coverage||metrics.contrast<params.min_ring_contrast)continue;
+      const strictPass=metrics.coverage>=params.homotypic_min_coverage&&metrics.contrast>=params.min_ring_contrast;
+      if(!strictPass&&(metrics.coverage<.2||metrics.quadrantCount<2))continue;
       const host=nearestHostDetection(inner,tumorDetections,metrics,params,inner.id);
-      if(!host||host.item.circularity>params.homotypic_host_max_circularity)continue;
+      if(!host)continue;
       const key=[inner.id,host.item.id].sort().join("|");
+      const areaRatio=(Number(inner.area_px)||Math.PI*(inner.radius||12)**2)
+        /Math.max(1,Number(host.item.area_px)||Math.PI*(host.item.radius||12)**2);
       const candidate={
         id:"",x:inner.x,y:inner.y,inner_radius:metrics.innerRadius,outer_radius:metrics.outerRadius,
         outer_x:host.item.x,outer_y:host.item.y,
@@ -540,14 +588,18 @@ function analyzeCicCandidates(red,width,height,nkDetections,tumorDetections,para
         inner_cell_type:"tumor",outer_cell_type:"tumor",
         type_hint:"homotypic",classification:"pending",
         enclosure_coverage:metrics.coverage,ring_contrast:metrics.contrast,
-        evidence_grade:"A",evidence_rule:"conservative_homotypic_enclosure",
+        evidence_grade:strictPass?"A":"L",evidence_rule:strictPass?"conservative_homotypic_enclosure":"local_learning_recovered_candidate",
         opposite_pairs:metrics.oppositePairs,quadrant_count:metrics.quadrantCount,
         largest_gap_sectors:metrics.largestGap,radial_coherence:metrics.radialCoherence,
         near_coverage:metrics.nearCoverage,far_coverage:metrics.farCoverage,
-        host_distance_px:host.distance,
-        confidence:cicConfidence(metrics,host.distance,params,"homotypic","A",1),
+        host_distance_px:host.distance,inner_host_area_ratio:areaRatio,inner_radius_typical_ratio:1,
+        confidence:cicConfidence(metrics,host.distance,params,"homotypic",strictPass?"A":"B",areaRatio),
         red_threshold:redThreshold,source:"automatic_2d_candidate",manual:false,reviewed:false,deleted:false,
       };
+      candidate.learning_score=cicLearningScore(candidate,learningModel.homotypic);
+      const morphologyPass=host.item.circularity<=params.homotypic_host_max_circularity;
+      if((!strictPass||!morphologyPass)&&(candidate.learning_score==null||candidate.learning_score<.62))continue;
+      if(candidate.learning_score!=null)candidate.confidence=Math.max(candidate.confidence,candidate.learning_score);
       if(!pairs.has(key)||candidate.confidence>pairs.get(key).confidence)pairs.set(key,candidate);
     }
     for(const candidate of pairs.values()){
@@ -555,10 +607,43 @@ function analyzeCicCandidates(red,width,height,nkDetections,tumorDetections,para
       events.push(candidate);
     }
   }
-  const gradeRank=event=>event.evidence_grade==="A"?2:event.evidence_grade==="B"?1:0;
-  events.sort((a,b)=>gradeRank(b)-gradeRank(a)||b.confidence-a.confidence);
+  const gradeBonus=event=>event.evidence_grade==="A"?.05:event.evidence_grade==="B"?.025:0;
+  const learnedRank=event=>(event.learning_score==null
+    ? Number(event.confidence)||0
+    : .55*event.learning_score+.45*(Number(event.confidence)||0))+gradeBonus(event);
+  events.sort((a,b)=>learnedRank(b)-learnedRank(a));
   const limit=Math.max(10,Math.round(params.max_candidates||200));
   return events.slice(0,limit).map((event,index)=>({...event,id:`cic-auto-${index+1}`}));
+}
+function nearestToPoint(point,detections,maxDistance=110) {
+  let best=null,distance=Infinity;
+  for(const item of detections){
+    const current=Math.hypot(item.x-point.x,item.y-point.y);
+    if(current<distance&&current<=maxDistance){best=item;distance=current;}
+  }
+  return best;
+}
+function describeManualProfile(red,width,height,innerDetections,hostDetections,point,params,type) {
+  const inner=nearestToPoint(point,innerDetections);
+  if(!inner)return null;
+  const redThreshold=Math.max(12,histogramQuantile(red,Number(params.red_quantile)||.72));
+  const metrics=enclosureMetrics(red,width,height,inner,params,redThreshold);
+  const host=nearestHostDetection(inner,hostDetections,metrics,{...params,min_host_separation_factor:.2},type==="homotypic"?inner.id:null);
+  if(!host)return null;
+  const areaRatio=(Number(inner.area_px)||Math.PI*(inner.radius||12)**2)
+    /Math.max(1,Number(host.item.area_px)||Math.PI*(host.item.radius||12)**2);
+  return {
+    x:inner.x,y:inner.y,inner_radius:metrics.innerRadius,outer_radius:metrics.outerRadius,
+    outer_x:host.item.x,outer_y:host.item.y,
+    inner_cell_id:inner.id,outer_cell_id:host.item.id,
+    inner_cell_type:type==="homotypic"?"tumor":"nk",outer_cell_type:"tumor",
+    type_hint:type,enclosure_coverage:metrics.coverage,ring_contrast:metrics.contrast,
+    opposite_pairs:metrics.oppositePairs,quadrant_count:metrics.quadrantCount,
+    largest_gap_sectors:metrics.largestGap,radial_coherence:metrics.radialCoherence,
+    near_coverage:metrics.nearCoverage,far_coverage:metrics.farCoverage,
+    host_distance_px:host.distance,inner_host_area_ratio:areaRatio,
+    inner_radius_typical_ratio:1,red_threshold:redThreshold,
+  };
 }
 
 async function analyzeCic(payload) {
@@ -569,10 +654,21 @@ async function analyzeCic(payload) {
     red.data,red.width,red.height,
     Array.isArray(payload.nkDetections)?payload.nkDetections:[],
     Array.isArray(payload.tumorDetections)?payload.tumorDetections:[],
-    {...payload.params}
+    {...payload.params},payload.learningModel||{}
   );
   postProgress("生成待人工复核 CIC 列表",.96);
   return {events,width:red.width,height:red.height};
+}
+async function describeManualCic(payload) {
+  const red=await decode(payload.redBuffer,payload.redExtension,"tumor");
+  const nk=Array.isArray(payload.nkDetections)?payload.nkDetections:[];
+  const tumor=Array.isArray(payload.tumorDetections)?payload.tumorDetections:[];
+  return {
+    profiles:{
+      heterotypic:describeManualProfile(red.data,red.width,red.height,nk,tumor,payload.point,payload.params,"heterotypic"),
+      homotypic:describeManualProfile(red.data,red.width,red.height,tumor,tumor,payload.point,payload.params,"homotypic"),
+    }
+  };
 }
 
 async function analyze(payload) {
@@ -628,6 +724,7 @@ onmessage = async event => {
     let result;
     if(event.data.type==="analyze")result=await analyze(event.data);
     else if(event.data.type==="analyze_cic")result=await analyzeCic(event.data);
+    else if(event.data.type==="describe_manual_cic")result=await describeManualCic(event.data);
     else return;
     postMessage({type: "result", ...result});
   } catch (error) {

@@ -1,5 +1,5 @@
 /* global UTIF */
-const APP_ASSET_VERSION = "20260729-hero1";
+const APP_ASSET_VERSION = "20260730-learning1";
 const DEFAULTS = {
   threshold_mode: "manual", threshold_low: 15, threshold_high: 255,
   gaussian_sigma: 1, opening_radius: 1, watershed_min_distance: 12,
@@ -26,6 +26,12 @@ const DEFAULT_CIC_PARAMS = {
   max_inner_host_area_ratio:1.5,
   max_inner_radius_factor:1.8,
 };
+const CIC_LEARNING_STORAGE_KEY = "cellscope-cic-learning-v1";
+const CIC_FEATURE_KEYS = [
+  "enclosure_coverage","ring_contrast","opposite_pairs","quadrant_count",
+  "largest_gap_sectors","radial_coherence","near_coverage","far_coverage",
+  "host_distance_px","inner_host_area_ratio","inner_radius_typical_ratio"
+];
 function defaultParams(target) {
   return {
     ...DEFAULTS,
@@ -72,6 +78,123 @@ function toast(message, error=false) {
 function extension(name) { return name.slice(name.lastIndexOf(".")).toLowerCase(); }
 function stem(name) { return name.slice(0, name.length - extension(name).length); }
 function escapeHtml(value) { return String(value).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c])); }
+function clamp01(value) { return Math.max(0,Math.min(1,Number(value)||0)); }
+function cicFeatureVector(event) {
+  if(!event||CIC_FEATURE_KEYS.some(key=>event[key]==null||!Number.isFinite(Number(event[key]))))return null;
+  return [
+    clamp01(event.enclosure_coverage),
+    clamp01((Number(event.ring_contrast)+.25)/.75),
+    clamp01(Number(event.opposite_pairs)/8),
+    clamp01(Number(event.quadrant_count)/4),
+    clamp01(1-Number(event.largest_gap_sectors)/16),
+    clamp01(event.radial_coherence),
+    clamp01(event.near_coverage),
+    clamp01(event.far_coverage),
+    clamp01(1-Number(event.host_distance_px)/180),
+    clamp01(1-Number(event.inner_host_area_ratio)/2),
+    clamp01(1-Math.abs(Number(event.inner_radius_typical_ratio)-1)/1.5),
+  ];
+}
+function readGlobalCicLearning() {
+  try {
+    const parsed=JSON.parse(localStorage.getItem(CIC_LEARNING_STORAGE_KEY)||"[]");
+    return Array.isArray(parsed)?parsed.filter(sample=>Array.isArray(sample.vector)&&sample.vector.length===CIC_FEATURE_KEYS.length):[];
+  } catch(error) {
+    console.warn("CIC 学习数据读取失败",error);return[];
+  }
+}
+function writeGlobalCicLearning(samples) {
+  try { localStorage.setItem(CIC_LEARNING_STORAGE_KEY,JSON.stringify(samples.slice(-5000))); }
+  catch(error) { console.warn("CIC 学习数据保存失败",error); }
+}
+function syncProjectLearningToGlobal() {
+  if(!state.project)return;
+  const retained=readGlobalCicLearning().filter(sample=>sample.project!==state.project.name);
+  writeGlobalCicLearning([...retained,...(state.project.cic_learning?.samples||[])]);
+}
+function allCicLearningSamples() {
+  const combined=[...readGlobalCicLearning(),...(state.project?.cic_learning?.samples||[])];
+  return [...new Map(combined.map(sample=>[sample.id,sample])).values()];
+}
+function cicLearningModelPayload() {
+  const enabled=state.project?.cic_learning?.enabled!==false;
+  const samples=enabled?allCicLearningSamples():[];
+  const payload={};
+  for(const type of ["heterotypic","homotypic"]){
+    const typed=samples.filter(sample=>sample.type===type&&Array.isArray(sample.vector));
+    const positive=typed.filter(sample=>sample.label===1).length;
+    const negative=typed.filter(sample=>sample.label===0).length;
+    payload[type]={active:positive>=3&&negative>=3,samples:typed.map(sample=>({vector:sample.vector,label:sample.label}))};
+  }
+  return payload;
+}
+function updateCicLearningUi() {
+  if(!$("cicLearningStatus"))return;
+  const samples=allCicLearningSamples();
+  const positive=samples.filter(sample=>sample.label===1).length;
+  const negative=samples.filter(sample=>sample.label===0).length;
+  const model=cicLearningModelPayload();
+  const enabled=state.project?.cic_learning?.enabled!==false;
+  const active=enabled&&(model.heterotypic.active||model.homotypic.active);
+  const heteroPositive=model.heterotypic.samples.filter(sample=>sample.label===1).length;
+  const heteroNegative=model.heterotypic.samples.filter(sample=>sample.label===0).length;
+  $("cicLearningPositive").textContent=positive;
+  $("cicLearningNegative").textContent=negative;
+  $("cicLearningStatus").textContent=!enabled
+    ?"学习排序已暂停"
+    :active
+    ?"模型已启用，后续筛查会学习排序"
+    :`异质学习还需正例 ${Math.max(0,3-heteroPositive)} / 反例 ${Math.max(0,3-heteroNegative)}`;
+  $("cicLearningEnabled").checked=enabled;
+}
+function recordCicLearning(event,label,type) {
+  const vector=cicFeatureVector(event);
+  if(!vector)return false;
+  const sample={
+    id:`${state.project.name}|${state.currentViewId}|${event.id}`,
+    project:state.project.name,view_id:state.currentViewId,event_id:event.id,
+    group:state.currentGroup,type,label,vector,
+    source:event.source==="manual"?"manual_false_negative":"reviewed_candidate",
+    created_at:new Date().toISOString(),
+  };
+  const projectSamples=state.project.cic_learning.samples;
+  const projectIndex=projectSamples.findIndex(item=>item.id===sample.id);
+  if(projectIndex>=0)projectSamples[projectIndex]=sample;else projectSamples.push(sample);
+  const globalSamples=readGlobalCicLearning();
+  const globalIndex=globalSamples.findIndex(item=>item.id===sample.id);
+  if(globalIndex>=0)globalSamples[globalIndex]=sample;else globalSamples.push(sample);
+  writeGlobalCicLearning(globalSamples);
+  updateCicLearningUi();
+  return true;
+}
+function exportCicLearning() {
+  const payload={
+    format:"cellscope-cic-learning",version:1,
+    feature_keys:CIC_FEATURE_KEYS,samples:allCicLearningSamples(),
+    exported_at:new Date().toISOString(),
+  };
+  downloadBlob(new Blob([JSON.stringify(payload,null,2)],{type:"application/json"}),"CellScope_CIC_学习数据.json");
+}
+async function importCicLearning(file) {
+  try{
+    const parsed=JSON.parse(await file.text());
+    if(parsed.format!=="cellscope-cic-learning"||!Array.isArray(parsed.samples))throw new Error("不是 CellScope CIC 学习数据");
+    const valid=parsed.samples.filter(sample=>
+      typeof sample.id==="string"&&["heterotypic","homotypic"].includes(sample.type)&&
+      (sample.label===0||sample.label===1)&&Array.isArray(sample.vector)&&
+      sample.vector.length===CIC_FEATURE_KEYS.length&&sample.vector.every(Number.isFinite)
+    );
+    const merged=[...new Map([...readGlobalCicLearning(),...valid].map(sample=>[sample.id,sample])).values()];
+    writeGlobalCicLearning(merged);updateCicLearningUi();scheduleAutosave();
+    toast(`已导入 ${valid.length} 条 CIC 学习样本`);
+  }catch(error){toast(`学习数据导入失败：${error.message}`,true);}
+}
+function resetCicLearning() {
+  if(!confirm("将清空这台浏览器积累的全部 CIC 学习样本，但不会删除已经确认的 CIC 标注。是否继续？"))return;
+  localStorage.removeItem(CIC_LEARNING_STORAGE_KEY);
+  if(state.project)state.project.cic_learning.samples=[];
+  updateCicLearningUi();scheduleAutosave();toast("已清空本机 CIC 学习样本");
+}
 
 async function scanFolder(fileList) {
   const files = [...fileList];
@@ -130,6 +253,7 @@ async function scanFolder(fileList) {
       Object.fromEntries(TARGETS.map(target => [target, defaultParams(target)]))
     ])),
     cic_parameters_by_group:Object.fromEntries(groups.map(group=>[group,{...DEFAULT_CIC_PARAMS}])),
+    cic_learning:{version:1,enabled:true,samples:[]},
     results:{}, created_at:new Date().toISOString(),
   };
   state.selectedGroups=new Set(groups);
@@ -148,6 +272,11 @@ function mergePendingProject() {
     return;
   }
   state.project.channel_labels = {...DEFAULT_CHANNEL_LABELS, ...(saved.channel_labels || {})};
+  state.project.cic_learning={
+    version:1,
+    enabled:saved.cic_learning?.enabled!==false,
+    samples:Array.isArray(saved.cic_learning?.samples)?saved.cic_learning.samples:[]
+  };
   if (Array.isArray(saved.selected_groups)) {
     state.selectedGroups=new Set(saved.selected_groups.filter(group=>state.project.groups.includes(group)));
   }
@@ -190,6 +319,7 @@ function mergePendingProject() {
     }
   }
   state.pendingProject = null;
+  syncProjectLearningToGlobal();
   updateHistoryButtons();
   toast("已恢复项目参数和计数结果");
 }
@@ -202,6 +332,7 @@ function openWorkspace() {
   $("projectMeta").textContent = `${state.project.groups.length} 个实验组 · ${state.project.views.length} 个视野`;
   $("pixelSizeBadge").textContent = `${state.project.pixel_size_um} µm/px`;
   refreshChannelLabels(); renderGroups(); renderResults();
+  updateCicLearningUi();
   const first = state.project.views.find(view => !view.error) || state.project.views[0];
   if (first) selectView(first.id);
   toast(`已在浏览器中识别 ${state.project.views.length} 个视野`);
@@ -718,12 +849,32 @@ function analyzeCicOne(view,params) {
       const redBuffer=await view.files.tumor.arrayBuffer();
       worker.postMessage({
         type:"analyze_cic",params,
+        learningModel:cicLearningModelPayload(),
         redBuffer,redExtension:extension(view.files.tumor.name),
         nkDetections:compactDetections(targetResult(view.id,"nk")?.detections),
         tumorDetections:compactDetections(targetResult(view.id,"tumor")?.detections),
         pixelSizeUm:state.project.pixel_size_um,
       },[redBuffer]);
     } catch(error){state.cancelReject=null;reject(error);}
+  });
+}
+function describeManualCicOne(view,point,params) {
+  return new Promise(async(resolve,reject)=>{
+    const worker=new Worker(`browser-worker.js?v=${APP_ASSET_VERSION}`);
+    worker.onmessage=event=>{
+      if(event.data.type==="result"){worker.terminate();resolve(event.data.profiles||{});}
+      else if(event.data.type==="error"){worker.terminate();reject(new Error(event.data.error));}
+    };
+    worker.onerror=event=>{worker.terminate();reject(new Error(event.message||"CIC 结构特征提取失败"));};
+    try{
+      const redBuffer=await view.files.tumor.arrayBuffer();
+      worker.postMessage({
+        type:"describe_manual_cic",point,params,
+        redBuffer,redExtension:extension(view.files.tumor.name),
+        nkDetections:compactDetections(targetResult(view.id,"nk")?.detections),
+        tumorDetections:compactDetections(targetResult(view.id,"tumor")?.detections),
+      },[redBuffer]);
+    }catch(error){worker.terminate();reject(error);}
   });
 }
 function cicPrerequisitesReady(view) {
@@ -843,6 +994,7 @@ function updateCounts() {
   $("currentTargetName").textContent=targetLabel(state.target);
   updateActionLabels();
   updateCicPrerequisiteUi();
+  updateCicLearningUi();
 }
 function updateActionLabels() {
   if (!state.project) return;
@@ -905,17 +1057,26 @@ function syncCicCorrections(message="CIC 修正已保存") {
   updateCounts();renderInspectionView();renderResults();
   scheduleAutosave();
   $("cicSelectionHint").textContent=message;
+  updateCicLearningUi();
 }
-function handleCicCanvasClick(event) {
+async function handleCicCanvasClick(event) {
   if(state.mode==="pan")return;
   if(cicStatus()!=="done"&&state.mode!=="cic-add")return toast("请先筛查当前视野 CIC 候选",true);
   const point=canvasPoint(event);
   if(state.mode==="cic-add"){
     pushHistory("cic");
     const id=`cic-manual-${Date.now()}`;
+    $("cicSelectionHint").textContent="正在提取漏检结构的内外细胞特征…";
+    let profiles={};
+    try{
+      profiles=await describeManualCicOne(viewById(state.currentViewId),point,state.project.cic_parameters_by_group[state.currentGroup]);
+    }catch(error){console.warn(error);}
+    const preferred=profiles.heterotypic||profiles.homotypic||{};
     state.cicEvents.push({
       id,x:point.x,y:point.y,inner_radius:18,outer_radius:54,
       classification:"pending",type_hint:"heterotypic",confidence:null,
+      ...preferred,id,classification:"pending",type_hint:"heterotypic",
+      learning_profiles:profiles,
       source:"manual",manual:true,reviewed:false,deleted:false,
     });
     state.selectedCicId=id;
@@ -924,13 +1085,15 @@ function handleCicCanvasClick(event) {
       ...(cicResult()||{}),status:"done",error:"",events:state.cicEvents
     };
     updateCounts();renderInspectionView();renderResults();
-    $("cicSelectionHint").textContent="已添加 CIC，请确认异质、同质或排除";
+    $("cicSelectionHint").textContent=Object.keys(profiles).some(key=>profiles[key])
+      ?"已提取结构特征，请确认异质、同质或排除；确认后会成为学习正例"
+      :"已添加标记，但附近未找到完整内外细胞配对；该标记不会用于学习";
     return;
   }
   const selected=cicEventAtPoint(point);
   state.selectedCicId=selected?.id||null;
   $("cicSelectionHint").textContent=selected
-    ? `${selected.id} · ${selected.evidence_grade?`${selected.evidence_grade} 级 · `:""}自动提示 ${selected.type_hint==="homotypic"?"同质":"异质"} · 包围 ${Number(selected.enclosure_coverage||0).toFixed(2)} · 对侧 ${selected.opposite_pairs??"—"}/8 · 象限 ${selected.quadrant_count??"—"}/4 · 径向 ${Number(selected.radial_coherence||0).toFixed(2)}`
+    ? `${selected.id} · ${selected.evidence_grade?`${selected.evidence_grade} 级 · `:""}自动提示 ${selected.type_hint==="homotypic"?"同质":"异质"} · 包围 ${Number(selected.enclosure_coverage||0).toFixed(2)} · 对侧 ${selected.opposite_pairs??"—"}/8 · 象限 ${selected.quadrant_count??"—"}/4 · 径向 ${Number(selected.radial_coherence||0).toFixed(2)}${selected.learning_score==null?"":` · 学习相似度 ${(selected.learning_score*100).toFixed(0)}%`}`
     :"未选中 CIC 候选";
   drawCicOverlay();
 }
@@ -938,15 +1101,22 @@ function classifySelectedCic(classification) {
   const event=state.cicEvents.find(item=>item.id===state.selectedCicId);
   if(!event)return toast("请先选择一个 CIC 候选",true);
   pushHistory("cic");
+  const profile=event.learning_profiles?.[classification];
+  if(profile)Object.assign(event,profile,{id:event.id,source:event.source,manual:true});
   event.classification=classification;event.reviewed=true;event.manual=true;
-  syncCicCorrections(classification==="heterotypic"?`已确认异质 CIC：${event.id}`:`已确认同质 CIC：${event.id}`);
+  const learned=recordCicLearning(event,1,classification);
+  syncCicCorrections(`${classification==="heterotypic"?"已确认异质":"已确认同质"} CIC：${event.id}${learned?"；已加入本机学习":""}`);
 }
 function rejectSelectedCic() {
   const event=state.cicEvents.find(item=>item.id===state.selectedCicId);
   if(!event)return toast("请先选择一个 CIC 候选",true);
   pushHistory("cic");
+  const type=event.type_hint==="homotypic"?"homotypic":"heterotypic";
+  const profile=event.learning_profiles?.[type];
+  if(profile)Object.assign(event,profile,{id:event.id,source:event.source,manual:true});
   event.classification="rejected";event.reviewed=true;event.manual=true;
-  syncCicCorrections(`已排除候选：${event.id}`);
+  const learned=recordCicLearning(event,0,type);
+  syncCicCorrections(`已排除候选：${event.id}${learned?"；已加入本机反例":""}`);
 }
 function deleteSelectedCic() {
   const event=state.cicEvents.find(item=>item.id===state.selectedCicId);
@@ -1019,6 +1189,7 @@ function serializableProject() {
     selected_groups:[...state.selectedGroups],
     groups:state.project.groups,parameters_by_group:state.project.parameters_by_group,
     cic_parameters_by_group:state.project.cic_parameters_by_group,
+    cic_learning:state.project.cic_learning,
     views:state.project.views.map(({id,group,name,width,height,status,error,fileNames})=>({id,group,name,width,height,status,error,fileNames})),
     results:serializedResults,updated_at:new Date().toISOString(),
   };
@@ -1087,7 +1258,7 @@ function cloneResult(value) {
 }
 function historySnapshot(kind,viewId=state.currentViewId,target=state.target) {
   const value=kind==="cic" ? state.project.results[viewId]?.cic : state.project.results[viewId]?.[target];
-  return {kind,viewId,target,value:cloneResult(value)};
+  return {kind,viewId,target,value:cloneResult(value),learning:kind==="cic"?cloneResult(state.project.cic_learning):null};
 }
 function pushHistory(kind,viewId=state.currentViewId,target=state.target) {
   state.undoStack.push(historySnapshot(kind,viewId,target));
@@ -1103,7 +1274,11 @@ function updateHistoryButtons() {
 async function restoreHistorySnapshot(snapshot) {
   if(!snapshot||!state.project)return;
   if(!state.project.results[snapshot.viewId])state.project.results[snapshot.viewId]={};
-  if(snapshot.kind==="cic")state.project.results[snapshot.viewId].cic=cloneResult(snapshot.value);
+  if(snapshot.kind==="cic"){
+    state.project.results[snapshot.viewId].cic=cloneResult(snapshot.value);
+    if(snapshot.learning)state.project.cic_learning=cloneResult(snapshot.learning);
+    syncProjectLearningToGlobal();
+  }
   else state.project.results[snapshot.viewId][snapshot.target]=cloneResult(snapshot.value);
   if(snapshot.viewId!==state.currentViewId)await selectView(snapshot.viewId);
   if(snapshot.kind==="cic"){
@@ -1115,6 +1290,7 @@ async function restoreHistorySnapshot(snapshot) {
     state.selectedId=null;
   }
   updateCounts();renderResults();renderGroups();renderInspectionView();scheduleAutosave();
+  updateCicLearningUi();
 }
 async function undoCorrection() {
   const snapshot=state.undoStack.pop();
@@ -1298,7 +1474,7 @@ function cellRawCsv(views=state.project.views) {
   return csvEncode(rows);
 }
 function cicRawCsv(views=state.project.views) {
-  const rows=[["实验组","视野","CIC编号","最终分类","自动提示","证据等级","判定规则","内部细胞类型","外部细胞类型","内部细胞编号","外部细胞编号","X_px","Y_px","包围比例","环内差异","对侧支持数_8","覆盖象限数_4","最大连续缺口_16","径向一致性","近层覆盖","远层覆盖","宿主核距离_px","内外细胞面积比","内部NK半径相对中位数","内部绿色阳性比例","置信分","来源","已人工复核","人工修正","已删除"]];
+  const rows=[["实验组","视野","CIC编号","最终分类","自动提示","证据等级","判定规则","内部细胞类型","外部细胞类型","内部细胞编号","外部细胞编号","X_px","Y_px","包围比例","环内差异","对侧支持数_8","覆盖象限数_4","最大连续缺口_16","径向一致性","近层覆盖","远层覆盖","宿主核距离_px","内外细胞面积比","内部NK半径相对中位数","内部绿色阳性比例","置信分","本地学习相似度","是否由学习扩展","来源","已人工复核","人工修正","已删除"]];
   for(const view of views){
     for(const event of cicResult(view.id)?.events||[]){
       const innerType=TARGETS.includes(event.inner_cell_type)?targetLabel(event.inner_cell_type):event.inner_cell_type;
@@ -1318,6 +1494,8 @@ function cicRawCsv(views=state.project.views) {
         event.inner_radius_typical_ratio==null?"":Number(event.inner_radius_typical_ratio).toFixed(4),
         event.inner_positive_fraction==null?"":Number(event.inner_positive_fraction).toFixed(4),
         event.confidence==null?"":Number(event.confidence).toFixed(4),
+        event.learning_score==null?"":Number(event.learning_score).toFixed(4),
+        event.evidence_rule==="local_learning_recovered_candidate",
         event.source,Boolean(event.reviewed),Boolean(event.manual),Boolean(event.deleted)
       ]);
     }
@@ -1933,6 +2111,19 @@ $("analyzeCicGroupBtn").onclick=()=>analyzeCicScope("group");
 $("analyzeCicAllBtn").onclick=()=>analyzeCicScope("all");
 $("reviewPendingCicBtn").onclick=reviewNextPendingCic;
 $("cicPptPresetBtn").onclick=applyCicPptPreset;
+$("cicLearningEnabled").onchange=event=>{
+  if(!state.project)return;
+  state.project.cic_learning.enabled=event.target.checked;
+  updateCicLearningUi();scheduleAutosave();
+  toast(event.target.checked?"已启用 CIC 本地学习排序":"已暂停 CIC 本地学习排序");
+};
+$("exportCicLearningBtn").onclick=exportCicLearning;
+$("importCicLearningInput").onchange=event=>{
+  const file=event.target.files[0];
+  if(file)importCicLearning(file);
+  event.target.value="";
+};
+$("resetCicLearningBtn").onclick=resetCicLearning;
 document.querySelectorAll("#channelTabs button").forEach(button=>button.onclick=async()=>{
   if(button.dataset.channel==="cic"){await activateCicReview();return;}
   if (TARGETS.includes(button.dataset.channel)) {

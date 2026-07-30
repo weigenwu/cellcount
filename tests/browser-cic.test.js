@@ -98,4 +98,28 @@ const doublePositiveOnly = context.analyzeCicCandidates(
 );
 assert.equal(doublePositiveOnly.length, 0);
 
+const manualProfile = context.describeManualProfile(
+  ringImage("one-sided"), width, height, nk, tumors,
+  {x:60,y:60}, {...defaults, homotypic_enabled:false}, "heterotypic"
+);
+assert(manualProfile);
+const learnedVector = context.cicLearningVector(manualProfile);
+assert.equal(learnedVector.length, 11);
+const learningModel = {
+  heterotypic:{
+    active:true,
+    samples:[
+      ...[0,1,2].map(()=>({vector:learnedVector,label:1})),
+      ...[0,1,2].map(()=>({vector:new Array(11).fill(0),label:0})),
+    ],
+  },
+};
+const learnedRecovery = context.analyzeCicCandidates(
+  ringImage("one-sided"), width, height, nk, tumors,
+  {...defaults, homotypic_enabled:false}, learningModel
+);
+assert.equal(learnedRecovery.length, 1);
+assert.equal(learnedRecovery[0].evidence_grade, "L");
+assert(learnedRecovery[0].learning_score > 0.62);
+
 console.log("browser CIC candidate tests passed");

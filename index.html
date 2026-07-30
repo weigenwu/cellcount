@@ -7,8 +7,8 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; worker-src 'self' blob:; connect-src 'self'">
   <title>CellScope · 浏览器细胞计数</title>
   <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="static/styles.css?v=20260729-hero1">
-  <link rel="stylesheet" href="browser.css?v=20260729-hero1">
+  <link rel="stylesheet" href="static/styles.css?v=20260730-learning1">
+  <link rel="stylesheet" href="browser.css?v=20260730-learning1">
 </head>
 <body>
   <header class="topbar">
@@ -252,6 +252,22 @@
           <article class="pending"><span>待复核候选</span><strong id="countCicPending">—</strong></article>
           <article><span>CIC 状态</span><strong id="countCicStatus">未分析</strong></article>
         </div>
+        <section class="cic-learning-panel" aria-label="CIC 本地学习">
+          <div class="cic-learning-head">
+            <div><span>本地主动学习</span><strong id="cicLearningStatus">等待人工标记</strong></div>
+            <label class="learning-switch"><input id="cicLearningEnabled" type="checkbox" checked>用于候选排序</label>
+          </div>
+          <div class="cic-learning-stats">
+            <span><b id="cicLearningPositive">0</b> 个 CIC 正例</span>
+            <span><b id="cicLearningNegative">0</b> 个排除反例</span>
+          </div>
+          <p>确认 CIC、排除假阳性和人工补充漏检都会保存在本机。同一 CIC 类型的正反例各达到 3 个后，模型会扩展并重排后续候选，但不会自动计入最终结果。</p>
+          <div class="cic-learning-actions">
+            <button id="exportCicLearningBtn">导出学习数据</button>
+            <label>导入学习数据<input id="importCicLearningInput" type="file" accept=".json"></label>
+            <button id="resetCicLearningBtn" class="danger">清空本机学习</button>
+          </div>
+        </section>
         <div class="batch-actions">
           <button class="button primary" id="analyzeCicCurrentBtn">筛查当前图片 CIC</button>
           <button class="button ghost" id="analyzeCicGroupBtn">批量当前组 CIC</button>
@@ -315,6 +331,6 @@
     <footer class="compare-help">滚轮缩放 · 左键拖拽 · 双击适应窗口；同步模式按相同图像坐标对齐，适合比较同尺寸视野。</footer>
   </section>
   <script src="static/vendor/UTIF.min.js"></script>
-  <script src="browser-app.js?v=20260729-hero1"></script>
+  <script src="browser-app.js?v=20260730-learning1"></script>
 </body>
 </html>

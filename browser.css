@@ -98,3 +98,17 @@
 .cic-count-cards article.pending { border-left-color: #ffbd4a; }
 .cic-count-cards span { display: block; color: var(--muted); font-size: 8px; }
 .cic-count-cards strong { display: block; margin-top: 2px; font-size: 16px; }
+.cic-learning-panel { margin: 9px 0; padding: 9px; border: 1px solid #274f46; border-radius: 9px; background: linear-gradient(145deg,rgba(25,55,48,.34),rgba(12,17,25,.9)); }
+.cic-learning-head { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+.cic-learning-head > div span { display: block; color: #72e4ad; font-size: 9px; font-weight: 700; }
+.cic-learning-head > div strong { display: block; margin-top: 2px; font-size: 11px; }
+.learning-switch { display: inline-flex !important; align-items: center; gap: 5px; color: #8fa39d !important; font-size: 8px !important; }
+.learning-switch input { width: auto !important; margin: 0 !important; }
+.cic-learning-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin-top: 8px; }
+.cic-learning-stats span { padding: 6px; border-radius: 6px; background: #0b1215; color: #81908e; font-size: 8px; }
+.cic-learning-stats b { color: #d9f8e9; font-size: 13px; margin-right: 3px; }
+.cic-learning-panel p { margin: 7px 0; color: #74827f; font-size: 8px; line-height: 1.55; }
+.cic-learning-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
+.cic-learning-actions button,.cic-learning-actions label { display: flex; align-items: center; justify-content: center; min-height: 27px; border: 1px solid #2a3a3a; border-radius: 6px; background: #101a1b; color: #91aaa4; font-size: 8px; cursor: pointer; }
+.cic-learning-actions label input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.cic-learning-actions .danger { grid-column: 1 / -1; color: #d68d94; border-color: #553238; background: #1b1216; }

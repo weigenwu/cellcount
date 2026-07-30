@@ -43,6 +43,7 @@ let browser, page;
   const errors=[];
   page.on("console",message=>message.type()==="error"&&errors.push(message.text()));
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
+  await page.evaluate(()=>localStorage.clear());
   assert.strictEqual(await page.locator(".welcome h1").textContent(),"荧光细胞计数与 CIC 复核");
   assert.strictEqual(await page.locator(".biology-legend span").count(),3);
   assert.strictEqual(await page.locator(".capability-rail span").count(),4);
@@ -117,6 +118,24 @@ let browser, page;
   });
   assert.strictEqual(await page.locator("#cicPrerequisiteBadge").textContent(),"三类计数已完成");
   assert.strictEqual(await page.locator("#analyzeCicCurrentBtn").isEnabled(),true);
+  await page.evaluate(()=>{
+    const features={
+      enclosure_coverage:.7,ring_contrast:.2,opposite_pairs:3,quadrant_count:4,
+      largest_gap_sectors:3,radial_coherence:.5,near_coverage:.6,far_coverage:.5,
+      host_distance_px:30,inner_host_area_ratio:.7,inner_radius_typical_ratio:1,
+      source:"automatic_2d_candidate"
+    };
+    recordCicLearning({id:"learn-positive",...features},1,"heterotypic");
+    recordCicLearning({id:"learn-negative",...features,enclosure_coverage:.2},0,"heterotypic");
+  });
+  assert.strictEqual(await page.locator("#cicLearningPositive").textContent(),"1");
+  assert.strictEqual(await page.locator("#cicLearningNegative").textContent(),"1");
+  assert.strictEqual(await page.evaluate(()=>serializableProject().cic_learning.samples.length),2);
+  if(process.env.CELLSCOPE_LEARNING_SCREENSHOT){
+    await page.locator("#cicPanel").evaluate(node=>node.open=true);
+    await page.locator(".cic-learning-panel").scrollIntoViewIfNeeded();
+    await page.screenshot({path:process.env.CELLSCOPE_LEARNING_SCREENSHOT,fullPage:true});
+  }
   assert.strictEqual(await page.evaluate(()=>cicRawCsv().includes("证据等级")&&cicRawCsv().includes("径向一致性")),true);
   assert.deepStrictEqual(errors,[]);
   await browser.close();
