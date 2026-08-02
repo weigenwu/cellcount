@@ -1,5 +1,5 @@
 /* global UTIF */
-const APP_ASSET_VERSION = "20260802-channelmap1";
+const APP_ASSET_VERSION = "20260802-exportzip1";
 const DEFAULTS = {
   threshold_mode: "manual", threshold_low: 15, threshold_high: 255,
   gaussian_sigma: 1, opening_radius: 1, watershed_min_distance: 12,
@@ -1454,6 +1454,101 @@ async function nestedDirectory(directory,path) {
 function safeRelativePath(path) {
   return String(path).split(/[\\/]+/).filter(Boolean).map(safeFileName).join("/");
 }
+const ZIP_CRC_TABLE=(()=>{
+  const table=new Uint32Array(256);
+  for(let index=0;index<256;index++){
+    let value=index;
+    for(let bit=0;bit<8;bit++)value=(value&1)?0xedb88320^(value>>>1):value>>>1;
+    table[index]=value>>>0;
+  }
+  return table;
+})();
+function zipDosTime(date=new Date()) {
+  const year=Math.max(1980,date.getFullYear());
+  return{
+    time:(date.getHours()<<11)|(date.getMinutes()<<5)|(date.getSeconds()>>1),
+    date:((year-1980)<<9)|((date.getMonth()+1)<<5)|date.getDate(),
+  };
+}
+async function blobCrc32(blob) {
+  let crc=0xffffffff;
+  const reader=blob.stream().getReader();
+  while(true){
+    const {done,value}=await reader.read();
+    if(done)break;
+    for(const byte of value)crc=ZIP_CRC_TABLE[(crc^byte)&0xff]^(crc>>>8);
+  }
+  return(crc^0xffffffff)>>>0;
+}
+function zipView(size) {
+  const bytes=new Uint8Array(size);
+  return{bytes,view:new DataView(bytes.buffer)};
+}
+class BrowserZipArchive {
+  constructor(){this.parts=[];this.entries=[];this.offset=0;this.encoder=new TextEncoder();}
+  async add(path,data) {
+    const blob=data instanceof Blob?data:new Blob([data]);
+    if(blob.size>0xffffffff||this.offset>0xffffffff)throw new Error("导出内容超过 ZIP 兼容大小（4 GB）");
+    const name=this.encoder.encode(safeRelativePath(path));
+    const crc=await blobCrc32(blob),stamp=zipDosTime();
+    const {bytes,view}=zipView(30);
+    view.setUint32(0,0x04034b50,true);view.setUint16(4,20,true);view.setUint16(6,0x0800,true);
+    view.setUint16(8,0,true);view.setUint16(10,stamp.time,true);view.setUint16(12,stamp.date,true);
+    view.setUint32(14,crc,true);view.setUint32(18,blob.size,true);view.setUint32(22,blob.size,true);
+    view.setUint16(26,name.length,true);view.setUint16(28,0,true);
+    this.parts.push(bytes,name,blob);
+    this.entries.push({name,crc,size:blob.size,offset:this.offset,...stamp});
+    this.offset+=bytes.length+name.length+blob.size;
+  }
+  finish() {
+    const central=[],centralStart=this.offset;
+    let centralSize=0;
+    for(const entry of this.entries){
+      const {bytes,view}=zipView(46);
+      view.setUint32(0,0x02014b50,true);view.setUint16(4,20,true);view.setUint16(6,20,true);
+      view.setUint16(8,0x0800,true);view.setUint16(10,0,true);view.setUint16(12,entry.time,true);view.setUint16(14,entry.date,true);
+      view.setUint32(16,entry.crc,true);view.setUint32(20,entry.size,true);view.setUint32(24,entry.size,true);
+      view.setUint16(28,entry.name.length,true);view.setUint16(30,0,true);view.setUint16(32,0,true);
+      view.setUint16(34,0,true);view.setUint16(36,0,true);view.setUint32(38,0,true);view.setUint32(42,entry.offset,true);
+      central.push(bytes,entry.name);centralSize+=bytes.length+entry.name.length;
+    }
+    const {bytes:end,view}=zipView(22);
+    view.setUint32(0,0x06054b50,true);view.setUint16(4,0,true);view.setUint16(6,0,true);
+    view.setUint16(8,this.entries.length,true);view.setUint16(10,this.entries.length,true);
+    view.setUint32(12,centralSize,true);view.setUint32(16,centralStart,true);view.setUint16(20,0,true);
+    return new Blob([...this.parts,...central,end],{type:"application/zip"});
+  }
+}
+async function createDirectoryExportSink(parent,rootName) {
+  const root=await parent.getDirectoryHandle(rootName,{create:true});
+  const directories=new Map([["",root]]);
+  async function getDirectory(path) {
+    const clean=safeRelativePath(path);
+    if(directories.has(clean))return directories.get(clean);
+    const handle=await nestedDirectory(root,clean);directories.set(clean,handle);return handle;
+  }
+  return{
+    kind:"directory",
+    async write(path,data){
+      const clean=safeRelativePath(path),slash=clean.lastIndexOf("/");
+      const directory=await getDirectory(slash<0?"":clean.slice(0,slash));
+      await writeLocalFile(directory,slash<0?clean:clean.slice(slash+1),data);
+    },
+    async finish(){},
+  };
+}
+function createZipExportSink(rootName) {
+  const archive=new BrowserZipArchive();
+  return{
+    kind:"zip",
+    write:(path,data)=>archive.add(`${rootName}/${path}`,data),
+    async finish(){downloadBlob(archive.finish(),`${rootName}.zip`);},
+  };
+}
+function isFileSystemAccessError(error) {
+  return ["NotAllowedError","SecurityError","InvalidStateError"].includes(error?.name)
+    || /not allowed|permission|user agent|platform|current context|getDirectoryHandle|createWritable/i.test(error?.message||"");
+}
 function canvasBlob(canvas) {
   return new Promise((resolve,reject)=>canvas.toBlob(
     blob=>blob?resolve(blob):reject(new Error("无法生成 PNG")),
@@ -1672,61 +1767,24 @@ async function svgToPngBlob(svg,width=1100,height=650) {
     return await canvasBlob(canvas);
   }finally{URL.revokeObjectURL(url);}
 }
-function downloadSummaryFiles() {
-  downloadBlob(new Blob([csvText()],{type:"text/csv;charset=utf-8"}),`${state.project.name}-cell-count-results.csv`);
-  setTimeout(()=>downloadBlob(new Blob([JSON.stringify(serializableProject(),null,2)],{type:"application/json"}),`${state.project.name}-cell-count-project.json`),250);
-  setTimeout(()=>downloadBlob(new Blob([cellRawCsv()],{type:"text/csv;charset=utf-8"}),`${state.project.name}-cell-object-raw-data.csv`),500);
-  setTimeout(()=>downloadBlob(new Blob([cicRawCsv()],{type:"text/csv;charset=utf-8"}),`${state.project.name}-CIC-raw-events.csv`),750);
-  setTimeout(()=>downloadBlob(new Blob([cicSummaryCsv()],{type:"text/csv;charset=utf-8"}),`${state.project.name}-CIC-group-summary.csv`),1000);
-  setTimeout(()=>downloadBlob(new Blob([cicPlotSvg()],{type:"image/svg+xml;charset=utf-8"}),`${state.project.name}-CIC-plot.svg`),1250);
-}
-async function exportResults() {
-  if (!state.project || state.busy) return;
-  const processedGroups=state.project.groups.filter(group=>
-    groupViews(group).some(view=>TARGETS.some(target=>targetStatus(view.id,target)!=="pending"))
-  );
-  if (!processedGroups.length) return toast("还没有处理完成的文件夹，请先运行至少一个通道",true);
-  if (!window.showDirectoryPicker) {
-    downloadSummaryFiles();
-    return toast("已导出 CSV 和项目 JSON；批量标注图文件夹需要使用最新版 Chrome 或 Edge",true);
-  }
-  let parent;
-  try {
-    parent=await window.showDirectoryPicker({mode:"readwrite"});
-  } catch(error) {
-    if (error.name!=="AbortError") toast(`无法选择导出目录：${error.message}`,true);
-    return;
-  }
-  state.busy=true;state.cancelled=false;
-  $("jobPanel").classList.remove("hidden");
-  $("cancelBtn").textContent="停止导出";
-  const errors=[];
-  try {
-    const root=await parent.getDirectoryHandle(`${safeFileName(state.project.name)}_cell-count-results`,{create:true});
-    const processedViews=state.project.views.filter(view=>processedGroups.includes(view.group));
-    await writeLocalFile(root,"全部文件夹汇总.csv",new Blob([csvText(processedViews)],{type:"text/csv;charset=utf-8"}));
-    await writeLocalFile(root,"细胞逐对象原始数据.csv",new Blob([cellRawCsv(processedViews)],{type:"text/csv;charset=utf-8"}));
-    await writeLocalFile(root,"CIC逐事件原始数据.csv",new Blob([cicRawCsv(processedViews)],{type:"text/csv;charset=utf-8"}));
-    await writeLocalFile(root,"CIC组汇总.csv",new Blob([cicSummaryCsv(processedViews)],{type:"text/csv;charset=utf-8"}));
+async function writeExportContents(sink,processedGroups) {
+    const errors=[],processedViews=state.project.views.filter(view=>processedGroups.includes(view.group));
+    await sink.write("全部文件夹汇总.csv",new Blob([csvText(processedViews)],{type:"text/csv;charset=utf-8"}));
+    await sink.write("细胞逐对象原始数据.csv",new Blob([cellRawCsv(processedViews)],{type:"text/csv;charset=utf-8"}));
+    await sink.write("CIC逐事件原始数据.csv",new Blob([cicRawCsv(processedViews)],{type:"text/csv;charset=utf-8"}));
+    await sink.write("CIC组汇总.csv",new Blob([cicSummaryCsv(processedViews)],{type:"text/csv;charset=utf-8"}));
     const cicSvg=cicPlotSvg(processedViews);
-    await writeLocalFile(root,"CIC组间图.svg",new Blob([cicSvg],{type:"image/svg+xml;charset=utf-8"}));
-    await writeLocalFile(root,"CIC组间图.png",await svgToPngBlob(cicSvg));
-    await writeLocalFile(root,"项目.json",new Blob([JSON.stringify(serializableProject(),null,2)],{type:"application/json"}));
-    const mirrored=await root.getDirectoryHandle("按原目录排列",{create:true});
+    await sink.write("CIC组间图.svg",new Blob([cicSvg],{type:"image/svg+xml;charset=utf-8"}));
+    await sink.write("CIC组间图.png",await svgToPngBlob(cicSvg));
+    await sink.write("项目.json",new Blob([JSON.stringify(serializableProject(),null,2)],{type:"application/json"}));
     const groupOutputs=new Map();
     for (const group of processedGroups) {
-      const groupDir=await nestedDirectory(mirrored,group);
-      const groupErrors=[];
-      await writeLocalFile(groupDir,"计数结果.csv",new Blob([csvText(groupViews(group))],{type:"text/csv;charset=utf-8"}));
-      await writeLocalFile(groupDir,"细胞逐对象原始数据.csv",new Blob([cellRawCsv(groupViews(group))],{type:"text/csv;charset=utf-8"}));
-      await writeLocalFile(groupDir,"CIC逐事件原始数据.csv",new Blob([cicRawCsv(groupViews(group))],{type:"text/csv;charset=utf-8"}));
-      await writeLocalFile(groupDir,"CIC组汇总.csv",new Blob([cicSummaryCsv(groupViews(group))],{type:"text/csv;charset=utf-8"}));
-      groupOutputs.set(group,{
-        directory:groupDir,
-        annotations:await groupDir.getDirectoryHandle("标注图",{create:true}),
-        cicAnnotations:await groupDir.getDirectoryHandle("CIC标注图",{create:true}),
-        errors:groupErrors,
-      });
+      const base=`按原目录排列/${safeRelativePath(group)}`,groupErrors=[];
+      await sink.write(`${base}/计数结果.csv`,new Blob([csvText(groupViews(group))],{type:"text/csv;charset=utf-8"}));
+      await sink.write(`${base}/细胞逐对象原始数据.csv`,new Blob([cellRawCsv(groupViews(group))],{type:"text/csv;charset=utf-8"}));
+      await sink.write(`${base}/CIC逐事件原始数据.csv`,new Blob([cicRawCsv(groupViews(group))],{type:"text/csv;charset=utf-8"}));
+      await sink.write(`${base}/CIC组汇总.csv`,new Blob([cicSummaryCsv(groupViews(group))],{type:"text/csv;charset=utf-8"}));
+      groupOutputs.set(group,{base,errors:groupErrors});
     }
     const tasks=[];
     for (const view of processedViews) {
@@ -1750,7 +1808,7 @@ async function exportResults() {
       try {
         const output=groupOutputs.get(view.group);
         const fileName=`${safeFileName(view.name)}__${safeFileName(targetLabel(target))}__${channelCodes[target]}__标注.png`;
-        await writeLocalFile(output.annotations,fileName,await annotatedBlob(view,target));
+        await sink.write(`${output.base}/标注图/${fileName}`,await annotatedBlob(view,target));
         manifest.push([view.group,view.name,targetLabel(target),viewCounts(view.id)[target].total,`按原目录排列/${safeRelativePath(view.group)}/标注图/${fileName}`,"done",""]);
       } catch(error) {
         const message=`${view.group} / ${view.name} / ${targetLabel(target)}：${error.message}`;
@@ -1771,7 +1829,7 @@ async function exportResults() {
       $("jobCurrent").textContent=`${view.group} / ${view.name} · CIC`;
       try{
         const fileName=`${safeFileName(view.name)}__CIC__标注.png`;
-        await writeLocalFile(output.cicAnnotations,fileName,await cicAnnotatedBlob(view));
+        await sink.write(`${output.base}/CIC标注图/${fileName}`,await cicAnnotatedBlob(view));
         const c=cicCounts(view.id);
         manifest.push([view.group,view.name,"CIC",c.heterotypic+c.homotypic,`按原目录排列/${safeRelativePath(view.group)}/CIC标注图/${fileName}`,"done",`待复核 ${c.pending}`]);
       }catch(error){
@@ -1782,12 +1840,50 @@ async function exportResults() {
     }
     const quote=value=>`"${String(value).replaceAll('"','""')}"`;
     const manifestText="\ufeff"+manifest.map(row=>row.map(quote).join(",")).join("\r\n");
-    await writeLocalFile(root,"标注图清单.csv",new Blob([manifestText],{type:"text/csv;charset=utf-8"}));
-    await writeLocalFile(root,"错误报告.txt",new Blob([errors.length?errors.join("\r\n"):"无错误"],{type:"text/plain;charset=utf-8"}));
+    await sink.write("标注图清单.csv",new Blob([manifestText],{type:"text/csv;charset=utf-8"}));
+    await sink.write("错误报告.txt",new Blob([errors.length?errors.join("\r\n"):"无错误"],{type:"text/plain;charset=utf-8"}));
     for (const output of groupOutputs.values()) {
-      await writeLocalFile(output.directory,"错误报告.txt",new Blob([output.errors.length?output.errors.join("\r\n"):"无错误"],{type:"text/plain;charset=utf-8"}));
+      await sink.write(`${output.base}/错误报告.txt`,new Blob([output.errors.length?output.errors.join("\r\n"):"无错误"],{type:"text/plain;charset=utf-8"}));
     }
-    toast(state.cancelled?"导出已停止；已完成文件保留在所选目录":"细胞计数、CIC 原始数据、汇总图和全部标注图已导出");
+    await sink.finish();
+}
+async function exportResults() {
+  if (!state.project || state.busy) return;
+  const processedGroups=state.project.groups.filter(group=>
+    groupViews(group).some(view=>TARGETS.some(target=>targetStatus(view.id,target)!=="pending"))
+  );
+  if (!processedGroups.length) return toast("还没有处理完成的文件夹，请先运行至少一个通道",true);
+  const rootName=`${safeFileName(state.project.name)}_cell-count-results`;
+  let sink,fallbackReason="";
+  if(window.showDirectoryPicker){
+    try{
+      const parent=await window.showDirectoryPicker({mode:"readwrite"});
+      sink=await createDirectoryExportSink(parent,rootName);
+    }catch(error){
+      if(error.name==="AbortError")return;
+      fallbackReason=error.message||error.name;sink=createZipExportSink(rootName);
+      console.warn("文件夹导出不可用，改用 ZIP",error);
+    }
+  }else{
+    fallbackReason="当前浏览器不支持文件夹写入";sink=createZipExportSink(rootName);
+  }
+  state.busy=true;state.cancelled=false;
+  $("jobPanel").classList.remove("hidden");
+  $("cancelBtn").textContent="停止导出";
+  try {
+    if(fallbackReason)toast("当前环境不能直接写入文件夹，正在自动生成 ZIP；数据和标注图不会减少");
+    try{
+      await writeExportContents(sink,processedGroups);
+    }catch(error){
+      if(sink.kind!=="directory"||!isFileSystemAccessError(error))throw error;
+      console.warn("文件夹写入过程中被拒绝，重新导出 ZIP",error);
+      toast("文件夹写入被浏览器拒绝，正在重新生成完整 ZIP");
+      state.cancelled=false;sink=createZipExportSink(rootName);
+      await writeExportContents(sink,processedGroups);
+    }
+    toast(state.cancelled
+      ? (sink.kind==="zip"?"导出已停止，已下载目前完成的 ZIP":"导出已停止；已完成文件保留在所选目录")
+      : (sink.kind==="zip"?"已下载 ZIP：包含计数、原始数据和全部标注图":"细胞计数、CIC 原始数据、汇总图和全部标注图已导出"));
   } catch(error) {
     toast(`导出失败：${error.message}`,true);
   } finally {

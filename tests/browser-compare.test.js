@@ -127,6 +127,23 @@ let browser, page;
   });
   assert.strictEqual(await page.locator("#cicPrerequisiteBadge").textContent(),"三类计数已完成");
   assert.strictEqual(await page.locator("#analyzeCicCurrentBtn").isEnabled(),true);
+  const zipDownload=page.waitForEvent("download");
+  await page.evaluate(()=>Object.defineProperty(window,"showDirectoryPicker",{
+    configurable:true,value:async()=>({
+      async getDirectoryHandle(){throw new DOMException("The request is not allowed by the user agent or the platform in the current context.","NotAllowedError");}
+    })
+  }));
+  await page.locator("#exportBtn").click();
+  const downloadedZip=await zipDownload;
+  const downloadedZipPath=await downloadedZip.path();
+  const zipBytes=fs.readFileSync(downloadedZipPath);
+  assert.match(downloadedZip.suggestedFilename(),/_cell-count-results\.zip$/);
+  assert.strictEqual(zipBytes.readUInt32LE(0),0x04034b50);
+  assert(zipBytes.includes(Buffer.from("全部文件夹汇总.csv")));
+  assert(zipBytes.includes(Buffer.from("标注图清单.csv")));
+  assert(zipBytes.lastIndexOf(Buffer.from([0x50,0x4b,0x05,0x06]))>0);
+  await page.waitForFunction(()=>!state.busy);
+  assert.match(await page.locator("#toast").textContent(),/已下载 ZIP/);
   await page.evaluate(()=>{
     const features={
       enclosure_coverage:.7,ring_contrast:.2,opposite_pairs:3,quadrant_count:4,
