@@ -1,5 +1,5 @@
 /* global UTIF */
-const APP_ASSET_VERSION = "20260730-learning1";
+const APP_ASSET_VERSION = "20260802-channelmap1";
 const DEFAULTS = {
   threshold_mode: "manual", threshold_low: 15, threshold_high: 255,
   gaussian_sigma: 1, opening_radius: 1, watershed_min_distance: 12,
@@ -196,6 +196,58 @@ function resetCicLearning() {
   updateCicLearningUi();scheduleAutosave();toast("已清空本机 CIC 学习样本");
 }
 
+function channelMappingKey(directory,base) {
+  return `${String(directory).toLowerCase()}/${String(base).toLowerCase()}`;
+}
+function parseLeicaChannelMapping(xmlText) {
+  try{
+    const documentNode=new DOMParser().parseFromString(xmlText,"application/xml");
+    if(documentNode.querySelector("parsererror"))return null;
+    const imageDescription=documentNode.getElementsByTagName("ImageDescription")[0];
+    const channels=imageDescription?.getElementsByTagName("Channels")[0];
+    const descriptions=channels?[...channels.children].filter(node=>node.tagName==="ChannelDescription"):[];
+    const colorTargets={blue:"dapi",green:"nk",red:"tumor"};
+    const mapping={},order=[];
+    descriptions.forEach((node,index)=>{
+      const color=String(node.getAttribute("LUTName")||"").trim().toLowerCase();
+      order.push(color);
+      if(colorTargets[color])mapping[colorTargets[color]]=`_ch${String(index).padStart(2,"0")}`;
+    });
+    if(!TARGETS.every(target=>mapping[target]))return null;
+    const dimensions=imageDescription?.getElementsByTagName("Dimensions")[0];
+    const xDimension=dimensions?[...dimensions.children].find(node=>node.tagName==="DimensionDescription"&&node.getAttribute("DimID")==="1"):null;
+    const elements=Number(xDimension?.getAttribute("NumberOfElements"));
+    const length=Number(xDimension?.getAttribute("Length"));
+    const unit=String(xDimension?.getAttribute("Unit")||"").toLowerCase();
+    const unitToUm=unit==="m"?1e6:unit==="mm"?1e3:unit==="µm"||unit==="um"?1:null;
+    const pixelSizeUm=elements>0&&length>0&&unitToUm?length/elements*unitToUm:null;
+    return{mapping,order,source:"leica_xml",pixelSizeUm};
+  }catch(error){console.warn("Leica 通道元数据解析失败",error);return null;}
+}
+async function detectLeicaChannelMappings(files,root) {
+  const mappings=new Map();
+  for(const file of files){
+    if(!/^Overlay.+\.xml$/i.test(file.name)||/_Properties\.xml$/i.test(file.name))continue;
+    const fullPath=file.webkitRelativePath||file.name;
+    const relative=fullPath.startsWith(root+"/")?fullPath.slice(root.length+1):fullPath;
+    const parts=relative.split("/");
+    const metadataIndex=parts.findIndex(part=>part.toLowerCase()==="metadata");
+    if(metadataIndex<0)continue;
+    const directory=parts.slice(0,metadataIndex).join("/");
+    const base=stem(file.name);
+    const parsed=parseLeicaChannelMapping(await file.text());
+    if(parsed)mappings.set(channelMappingKey(directory,base),parsed);
+  }
+  return mappings;
+}
+function channelMappingText(mapping) {
+  const short=value=>String(value||"").replace(/^_/,"");
+  return `${targetLabel("dapi")} ${short(mapping.dapi)} · ${targetLabel("nk")} ${short(mapping.nk)} · ${targetLabel("tumor")} ${short(mapping.tumor)}`;
+}
+function channelMappingSignature(mapping) {
+  return TARGETS.map(target=>`${target}:${mapping?.[target]||""}`).join("|").toLowerCase();
+}
+
 async function scanFolder(fileList) {
   const files = [...fileList];
   if (!files.length) return;
@@ -208,44 +260,61 @@ async function scanFolder(fileList) {
     const relative = path.startsWith(root + "/") ? path.slice(root.length + 1) : path;
     map.set(relative.toLowerCase(), {file, relative});
   });
+  const detectedMappings=await detectLeicaChannelMappings(files,root);
   let pixelSizeUm = 0.218;
   const propertyFile = files.find(file => /_properties\.xml$/i.test(file.name));
   if (propertyFile) {
     const match = (await propertyFile.text()).match(/Voxel="([\d.]+)"/);
     if (match) pixelSizeUm = Number(match[1]);
   }
-  const views = [];
+  const candidates=new Map();
   for (const {file, relative} of map.values()) {
     if (!supported.has(extension(file.name))) continue;
     const fileStem = stem(file.name);
-    if (!fileStem.toLowerCase().endsWith(suffixes.dapi.toLowerCase())) continue;
-    const base = fileStem.slice(0, -suffixes.dapi.length);
+    const channelMatch=fileStem.match(/^(.*)(_ch\d+)$/i);
+    if(!channelMatch)continue;
+    const base=channelMatch[1];
     const slash = relative.lastIndexOf("/");
     const directory = slash >= 0 ? relative.slice(0, slash) : "";
+    const candidateKey=channelMappingKey(directory,base);
+    const preference={".tif":4,".tiff":4,".png":3,".jpg":2,".jpeg":2}[extension(file.name)]||1;
+    if(!candidates.has(candidateKey)||preference>candidates.get(candidateKey).preference){
+      candidates.set(candidateKey,{base,directory,ext:extension(file.name),preference});
+    }
+  }
+  const views = [];
+  for(const candidate of candidates.values()){
+    const {base,directory,ext}=candidate;
     const group = directory || root;
-    const ext = extension(file.name);
     const key = name => `${directory ? directory + "/" : ""}${name}${ext}`.toLowerCase();
     const findAny = name => map.get(key(name)) || [...map.values()].find(item => {
       const itemSlash = item.relative.lastIndexOf("/");
       const itemDir = itemSlash >= 0 ? item.relative.slice(0, itemSlash) : "";
       return itemDir.toLowerCase() === directory.toLowerCase() && stem(item.file.name).toLowerCase() === name.toLowerCase() && supported.has(extension(item.file.name));
     });
-    const nk = findAny(base + suffixes.nk), tumor = findAny(base + suffixes.tumor), overlay = findAny(base);
+    const detected=detectedMappings.get(channelMappingKey(directory,base));
+    const channelMapping={...(detected?.mapping||suffixes)};
+    const dapi=findAny(base+channelMapping.dapi),nk=findAny(base+channelMapping.nk),tumor=findAny(base+channelMapping.tumor),overlay=findAny(base);
     const errors = [];
+    if (!dapi) errors.push(`缺少蓝色 ${targetLabel("dapi")} 通道`);
     if (!nk) errors.push(`缺少绿色 ${targetLabel("nk")} 通道`);
     if (!tumor) errors.push(`缺少红色 ${targetLabel("tumor")} 通道`);
     views.push({
       id: `${group}/${base}`, group, name: base,
-      files: {dapi:file, nk:nk?.file || null, tumor:tumor?.file || null, overlay:overlay?.file || file},
-      fileNames: {dapi:file.name, nk:nk?.file.name || "", tumor:tumor?.file.name || "", overlay:overlay?.file.name || file.name},
+      files: {dapi:dapi?.file||null, nk:nk?.file||null, tumor:tumor?.file||null, overlay:overlay?.file||dapi?.file||null},
+      fileNames: {dapi:dapi?.file.name||"", nk:nk?.file.name||"", tumor:tumor?.file.name||"", overlay:overlay?.file.name||dapi?.file.name||""},
+      channel_mapping:channelMapping,
+      channel_mapping_source:detected?.source||"manual_suffix",
+      channel_lut_order:detected?.order||[],
+      pixel_size_um:detected?.pixelSizeUm||pixelSizeUm,
       width:0, height:0, status:errors.length ? "error" : "pending", error:errors.join("；"),
     });
   }
-  if (!views.length) return toast(`没有找到以 ${suffixes.dapi} 结尾的 ${targetLabel("dapi")} 图片`, true);
+  if (!views.length) return toast("没有找到可配对的 _ch00 / _ch01 / _ch02 通道图片", true);
   views.sort((a,b) => a.id.localeCompare(b.id, "zh-CN", {numeric:true}));
   const groups = [...new Set(views.map(view => view.group))];
   state.project = {
-    version:2, browserVersion:true, name:root, pixel_size_um:pixelSizeUm, suffixes,
+    version:3, browserVersion:true, name:root, pixel_size_um:pixelSizeUm, suffixes,
     channel_labels:{...DEFAULT_CHANNEL_LABELS},
     groups, views,
     parameters_by_group:Object.fromEntries(groups.map(group => [
@@ -295,9 +364,16 @@ function mergePendingProject() {
       ...(saved.cic_parameters_by_group?.[group]||saved.cic_parameters||{})
     };
   }
+  let channelMismatchCount=0;
   for (const view of state.project.views) {
     if (saved.results?.[view.id]) {
       const savedResult = saved.results[view.id];
+      const savedView=(saved.views||[]).find(item=>item.id===view.id);
+      const savedMapping=savedView?.channel_mapping||saved.channel_mapping||saved.suffixes;
+      if(channelMappingSignature(savedMapping)!==channelMappingSignature(view.channel_mapping)){
+        channelMismatchCount++;
+        continue;
+      }
     if (savedResult.dapi || savedResult.nk || savedResult.tumor) {
         state.project.results[view.id] = {};
         for (const target of TARGETS) {
@@ -321,7 +397,9 @@ function mergePendingProject() {
   state.pendingProject = null;
   syncProjectLearningToGlobal();
   updateHistoryButtons();
-  toast("已恢复项目参数和计数结果");
+  toast(channelMismatchCount
+    ? `检测到 ${channelMismatchCount} 个视野的通道顺序已变化，旧计数未恢复，请重新分析`
+    : "已恢复项目参数和计数结果",channelMismatchCount>0);
 }
 
 function openWorkspace() {
@@ -331,11 +409,24 @@ function openWorkspace() {
   $("projectName").textContent = state.project.name;
   $("projectMeta").textContent = `${state.project.groups.length} 个实验组 · ${state.project.views.length} 个视野`;
   $("pixelSizeBadge").textContent = `${state.project.pixel_size_um} µm/px`;
-  refreshChannelLabels(); renderGroups(); renderResults();
+  refreshChannelLabels();renderChannelMappingSummary();renderGroups();renderResults();
   updateCicLearningUi();
   const first = state.project.views.find(view => !view.error) || state.project.views[0];
   if (first) selectView(first.id);
   toast(`已在浏览器中识别 ${state.project.views.length} 个视野`);
+}
+function renderChannelMappingSummary() {
+  if(!state.project||!$("channelMappingSummary"))return;
+  const validViews=state.project.views.filter(view=>!view.error);
+  const automatic=validViews.filter(view=>view.channel_mapping_source==="leica_xml").length;
+  const descriptions=[...new Set(validViews.map(view=>channelMappingText(view.channel_mapping)))];
+  const allAutomatic=validViews.length>0&&automatic===validViews.length;
+  $("channelMappingSummary").classList.toggle("warning",!allAutomatic);
+  $("channelMappingTitle").textContent=allAutomatic?"已按 Leica XML 匹配通道":"部分通道使用手动后缀";
+  $("channelMappingDetail").textContent=descriptions.length===1
+    ? descriptions[0]
+    : `${descriptions.length} 种通道顺序，已逐视野匹配`;
+  $("channelMappingSummary").title=validViews.map(view=>`${view.group}/${view.name}：${channelMappingText(view.channel_mapping)}（${view.channel_mapping_source==="leica_xml"?"XML自动":"手动"}）`).join("\n");
 }
 function groupViews(group) { return state.project.views.filter(view => view.group === group); }
 function viewById(id) { return state.project.views.find(view => view.id === id); }
@@ -410,6 +501,7 @@ async function selectView(id) {
   state.currentGroup = view.group;
   $("currentGroupLabel").textContent = view.group;
   $("currentViewLabel").textContent = view.name;
+  $("pixelSizeBadge").textContent=`${Number(view.pixel_size_um||state.project.pixel_size_um).toFixed(3)} µm/px`;
   $("profileGroup").textContent = `${view.group} · ${targetLabel(state.target)}`;
   populateParameters(state.project.parameters_by_group[view.group][state.target]);
   state.detections = targetResult(id)?.detections || [];
@@ -664,7 +756,8 @@ function saveParameters(all=false) {
 function updateAreaNote() {
   if (!state.project) return;
   const area = Number($("minArea").value||0);
-  $("areaConversion").textContent = `${area} px² ≈ ${(area*state.project.pixel_size_um**2).toFixed(1)} µm²`;
+  const pixelSize=viewById(state.currentViewId)?.pixel_size_um||state.project.pixel_size_um;
+  $("areaConversion").textContent = `${area} px² ≈ ${(area*pixelSize**2).toFixed(1)} µm²`;
 }
 
 const cicFieldMap={
@@ -745,7 +838,7 @@ function analyzeOne(view, params, target) {
       const transfers = anchorBuffer ? [channelBuffer,anchorBuffer] : [channelBuffer];
       worker.postMessage({
         type:"analyze", params, target, targetLabel:targetLabel(target),
-        pixelSizeUm:state.project.pixel_size_um,
+        pixelSizeUm:view.pixel_size_um||state.project.pixel_size_um,
         channelBuffer, channelExtension:extension(view.files[target].name),
         anchorBuffer, anchorExtension:guided ? extension(view.files.dapi.name) : null,
         anchorParams:guided ? state.project.parameters_by_group[view.group].dapi : null,
@@ -853,7 +946,7 @@ function analyzeCicOne(view,params) {
         redBuffer,redExtension:extension(view.files.tumor.name),
         nkDetections:compactDetections(targetResult(view.id,"nk")?.detections),
         tumorDetections:compactDetections(targetResult(view.id,"tumor")?.detections),
-        pixelSizeUm:state.project.pixel_size_um,
+        pixelSizeUm:view.pixel_size_um||state.project.pixel_size_um,
       },[redBuffer]);
     } catch(error){state.cancelReject=null;reject(error);}
   });
@@ -1132,7 +1225,8 @@ function handleCanvasClick(event) {
   const point=canvasPoint(event);
   if (state.mode==="add") {
     pushHistory("cell");
-    state.detections.push({id:`manual-${Date.now()}`,x:point.x,y:point.y,area_px:452.39,area_um2:452.39*state.project.pixel_size_um**2,radius:12,circularity:1,classification:state.target,manual:true,deleted:false});
+    const pixelSize=viewById(state.currentViewId)?.pixel_size_um||state.project.pixel_size_um;
+    state.detections.push({id:`manual-${Date.now()}`,x:point.x,y:point.y,area_px:452.39,area_um2:452.39*pixelSize**2,radius:12,circularity:1,classification:state.target,manual:true,deleted:false});
     syncCorrections(); return;
   }
   const best=detectionAtPoint(point);
@@ -1184,13 +1278,15 @@ function serializableProject() {
     }
   }
   return {
-    version:2,browserVersion:true,name:state.project.name,pixel_size_um:state.project.pixel_size_um,
+    version:3,browserVersion:true,name:state.project.name,pixel_size_um:state.project.pixel_size_um,
     suffixes:state.project.suffixes,channel_labels:state.project.channel_labels,
     selected_groups:[...state.selectedGroups],
     groups:state.project.groups,parameters_by_group:state.project.parameters_by_group,
     cic_parameters_by_group:state.project.cic_parameters_by_group,
     cic_learning:state.project.cic_learning,
-    views:state.project.views.map(({id,group,name,width,height,status,error,fileNames})=>({id,group,name,width,height,status,error,fileNames})),
+    views:state.project.views.map(({id,group,name,width,height,status,error,fileNames,channel_mapping,channel_mapping_source,channel_lut_order,pixel_size_um})=>({
+      id,group,name,width,height,status,error,fileNames,channel_mapping,channel_mapping_source,channel_lut_order,pixel_size_um
+    })),
     results:serializedResults,updated_at:new Date().toISOString(),
   };
 }
@@ -1427,7 +1523,7 @@ function csvText(views=state.project.views) {
     ...TARGETS.map(target=>`${targetLabel(target)}修正数`),
     "CIC人工修正数",
     ...TARGETS.map(target=>`${targetLabel(target)}状态`),
-    "CIC状态",
+    "CIC状态","DAPI原始文件","NK原始文件","肿瘤原始文件","通道映射来源","像素尺寸_um_per_px",
     "错误"
   ];
   const rows=views.map(view=>{
@@ -1445,7 +1541,9 @@ function csvText(views=state.project.views) {
       c.dapi.corrected,c.nk.corrected,c.tumor.corrected,
       cic.corrected,
       targetStatus(view.id,"dapi"),targetStatus(view.id,"nk"),targetStatus(view.id,"tumor"),
-      cicStatus(view.id),view.error||cicResult(view.id)?.error||""
+      cicStatus(view.id),view.fileNames.dapi,view.fileNames.nk,view.fileNames.tumor,
+      view.channel_mapping_source,view.pixel_size_um||state.project.pixel_size_um,
+      view.error||cicResult(view.id)?.error||""
     ];
   });
   const quote=value=>`"${String(value).replaceAll('"','""')}"`;

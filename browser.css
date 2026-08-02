@@ -13,6 +13,12 @@
 .group-selection-actions { display: flex; align-items: center; gap: 5px; margin: -3px 8px 8px; }
 .group-selection-actions span { flex: 1; color: #718096; font-size: 9px; }
 .group-selection-actions button { border: 1px solid #293547; border-radius: 5px; background: #101722; color: #91a0b4; padding: 4px 7px; cursor: pointer; font-size: 9px; }
+.channel-mapping-summary { margin-top: 11px; padding: 8px; border: 1px solid #285645; border-radius: 8px; background: #0c1b18; }
+.channel-mapping-summary strong,.channel-mapping-summary span { display: block; }
+.channel-mapping-summary strong { color: #70dda7; font-size: 9px; }
+.channel-mapping-summary span { margin-top: 4px; color: #9bada8; font-size: 8px; line-height: 1.5; }
+.channel-mapping-summary.warning { border-color: #66512b; background: #20190f; }
+.channel-mapping-summary.warning strong { color: #ffcf78; }
 .group-header { cursor: default; gap: 7px; }
 .group-select { display: grid; place-items: center; cursor: pointer; }
 .group-select input { width: 14px; height: 14px; accent-color: #6c7cff; cursor: pointer; }

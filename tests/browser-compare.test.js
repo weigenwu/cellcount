@@ -13,10 +13,13 @@ const png = Buffer.from(
 const experiment = fs.mkdtempSync(path.join(os.tmpdir(), "cellscope-compare-"));
 const group = path.join(experiment, "实验组A");
 fs.mkdirSync(group);
+const metadata = path.join(group, "MetaData");
+fs.mkdirSync(metadata);
 for (const view of ["Overlay001", "Overlay002"]) {
   for (const suffix of ["", "_ch00", "_ch01", "_ch02"]) {
     fs.writeFileSync(path.join(group, `${view}${suffix}.png`), png);
   }
+  fs.writeFileSync(path.join(metadata,`${view}.xml`),`<?xml version="1.0"?><Data><Image><ImageDescription><Channels><ChannelDescription LUTName="Red"/><ChannelDescription LUTName="Green"/><ChannelDescription LUTName="Blue"/></Channels><Dimensions><DimensionDescription DimID="1" NumberOfElements="100" Length="2.18e-5" Unit="m"/></Dimensions></ImageDescription></Image></Data>`);
 }
 
 const mime = {".html":"text/html", ".js":"text/javascript", ".css":"text/css"};
@@ -59,6 +62,12 @@ let browser, page;
   await page.locator("#folderInput").setInputFiles(experiment);
   await page.waitForTimeout(800);
   assert.match(await page.locator("#projectMeta").textContent(),/2 个视野/);
+  assert.strictEqual(await page.evaluate(()=>state.project.views[0].fileNames.dapi),"Overlay001_ch02.png");
+  assert.strictEqual(await page.evaluate(()=>state.project.views[0].fileNames.nk),"Overlay001_ch01.png");
+  assert.strictEqual(await page.evaluate(()=>state.project.views[0].fileNames.tumor),"Overlay001_ch00.png");
+  assert(Math.abs(await page.evaluate(()=>state.project.views[0].pixel_size_um)-0.218)<1e-9);
+  assert.match(await page.locator("#channelMappingTitle").textContent(),/Leica XML/);
+  assert.match(await page.locator("#channelMappingDetail").textContent(),/DAPI ch02.*NK ch01.*肿瘤 ch00/);
   assert.strictEqual(await page.locator("#cicPanel").evaluate(node=>node.open),false);
   assert.strictEqual(await page.locator("#analyzeCicCurrentBtn").isDisabled(),true);
   assert.strictEqual(await page.locator("#cicPrerequisiteBadge").textContent(),"当前视野 0/3");
@@ -137,6 +146,33 @@ let browser, page;
     await page.screenshot({path:process.env.CELLSCOPE_LEARNING_SCREENSHOT,fullPage:true});
   }
   assert.strictEqual(await page.evaluate(()=>cicRawCsv().includes("证据等级")&&cicRawCsv().includes("径向一致性")),true);
+  if(process.env.CELLSCOPE_REAL_FOLDER){
+    const realPage=await browser.newPage({viewport:{width:1500,height:900}});
+    realPage.setDefaultTimeout(60000);
+    await realPage.goto(`http://127.0.0.1:${server.address().port}/`);
+    await realPage.evaluate(()=>indexedDB.deleteDatabase("cellscope-projects"));
+    await realPage.locator("#folderInput").setInputFiles(process.env.CELLSCOPE_REAL_FOLDER);
+    await realPage.waitForFunction(()=>state.project?.views?.length>0);
+    const mappingAudit=await realPage.evaluate(()=>({
+      views:state.project.views.length,
+      mappings:[...new Set(state.project.views.map(view=>JSON.stringify(view.channel_mapping)))],
+      sources:[...new Set(state.project.views.map(view=>view.channel_mapping_source))],
+      files:state.project.views.slice(0,2).map(view=>view.fileNames),
+      pixelsByGroup:Object.fromEntries(state.project.groups.map(group=>[
+        group,[...new Set(state.project.views.filter(view=>view.group===group).map(view=>Number(view.pixel_size_um.toFixed(3))))].sort()
+      ])),
+      title:document.querySelector("#channelMappingTitle").textContent,
+      detail:document.querySelector("#channelMappingDetail").textContent,
+    }));
+    assert.strictEqual(mappingAudit.views,20);
+    assert.deepStrictEqual(mappingAudit.sources,["leica_xml"]);
+    assert(mappingAudit.files.every(files=>/_ch02\.(tif|jpg)$/i.test(files.dapi)&&/_ch01\.(tif|jpg)$/i.test(files.nk)&&/_ch00\.(tif|jpg)$/i.test(files.tumor)));
+    assert.deepStrictEqual(mappingAudit.pixelsByGroup["0"],[0.218]);
+    assert.deepStrictEqual(mappingAudit.pixelsByGroup["0.1"],[0.218,0.436]);
+    if(process.env.CELLSCOPE_CHANNEL_SCREENSHOT)await realPage.screenshot({path:process.env.CELLSCOPE_CHANNEL_SCREENSHOT,fullPage:true});
+    console.log("real folder channel audit",mappingAudit);
+    await realPage.close();
+  }
   assert.deepStrictEqual(errors,[]);
   await browser.close();
   server.close();

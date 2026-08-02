@@ -7,8 +7,8 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; worker-src 'self' blob:; connect-src 'self'">
   <title>CellScope · 浏览器细胞计数</title>
   <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="static/styles.css?v=20260730-learning1">
-  <link rel="stylesheet" href="browser.css?v=20260730-learning1">
+  <link rel="stylesheet" href="static/styles.css?v=20260802-channelmap1">
+  <link rel="stylesheet" href="browser.css?v=20260802-channelmap1">
 </head>
 <body>
   <header class="topbar">
@@ -37,7 +37,7 @@
         <p>批量识别 · 分通道校准 · 人工修正 · 标注图导出</p>
         <div class="welcome-actions">
           <label class="button primary large file-button">选择实验文件夹<input id="welcomeFolderInput" type="file" webkitdirectory multiple accept=".tif,.tiff,.png,.jpg,.jpeg,.xml"></label>
-          <button class="welcome-link" id="mappingToggleBtn">自定义通道后缀</button>
+          <button class="welcome-link" id="mappingToggleBtn">无 XML 时手动映射</button>
         </div>
         <div class="local-assurance"><span></span><strong>仅在本机分析</strong>原始图片不上传</div>
       </div>
@@ -60,6 +60,10 @@
         <span class="eyebrow">当前项目</span>
         <h2 id="projectName">—</h2>
         <p id="projectMeta">—</p>
+        <div id="channelMappingSummary" class="channel-mapping-summary">
+          <strong id="channelMappingTitle">正在检查通道顺序</strong>
+          <span id="channelMappingDetail">—</span>
+        </div>
       </div>
       <div class="sidebar-label">选择要批量处理的文件夹</div>
       <div class="group-selection-actions">
@@ -331,6 +335,6 @@
     <footer class="compare-help">滚轮缩放 · 左键拖拽 · 双击适应窗口；同步模式按相同图像坐标对齐，适合比较同尺寸视野。</footer>
   </section>
   <script src="static/vendor/UTIF.min.js"></script>
-  <script src="browser-app.js?v=20260730-learning1"></script>
+  <script src="browser-app.js?v=20260802-channelmap1"></script>
 </body>
 </html>
