@@ -7,8 +7,8 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; worker-src 'self' blob:; connect-src 'self'">
   <title>CellScope · 浏览器细胞计数</title>
   <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="static/styles.css?v=20260802-exportzip1">
-  <link rel="stylesheet" href="browser.css?v=20260802-exportzip1">
+  <link rel="stylesheet" href="static/styles.css?v=20260830-counting2">
+  <link rel="stylesheet" href="browser.css?v=20260830-counting2">
 </head>
 <body>
   <header class="topbar">
@@ -33,7 +33,7 @@
           <span><i class="green"></i>NK 细胞</span>
           <span><i class="red"></i>肿瘤细胞</span>
         </div>
-        <h1>荧光细胞计数<br><em>与 CIC 复核</em></h1>
+        <h1>荧光细胞<br><em>批量计数</em></h1>
         <p>批量识别 · 分通道校准 · 人工修正 · 标注图导出</p>
         <div class="welcome-actions">
           <label class="button primary large file-button">选择实验文件夹<input id="welcomeFolderInput" type="file" webkitdirectory multiple accept=".tif,.tiff,.png,.jpg,.jpeg,.xml"></label>
@@ -49,7 +49,7 @@
       <div class="capability-rail" aria-label="分析流程">
         <span><b>01</b><i>批量读取</i><small>实验文件夹</small></span>
         <span><b>02</b><i>三通道计数</i><small>独立阈值</small></span>
-        <span><b>03</b><i>CIC 复核</i><small>同质与异质</small></span>
+        <span><b>03</b><i>人工复核</i><small>增删标记</small></span>
         <span><b>04</b><i>结果导出</i><small>数据与标注图</small></span>
       </div>
       <small class="hero-image-note">示意性荧光背景 · 非实验数据</small>
@@ -85,7 +85,6 @@
           <button data-channel="dapi"><span class="dot blue"></span><span id="viewerLabelDapi">DAPI</span></button>
           <button data-channel="nk"><span class="dot green"></span><span id="viewerLabelNk">NK</span></button>
           <button data-channel="tumor"><span class="dot red"></span><span id="viewerLabelTumor">肿瘤</span></button>
-          <button data-channel="cic" class="cic-tab"><span class="dot amber"></span>CIC 复核</button>
         </div>
         <div class="viewer-actions">
           <button class="icon-button text compare-button" id="compareBtn" title="并排查看两个视野">双视野比较</button>
@@ -136,22 +135,6 @@
         </div>
       </div>
 
-      <div id="cicReviewBar" class="review-bar hidden">
-        <div class="review-mode">
-          <span>CIC 复核</span>
-          <button id="cicSelectModeBtn" class="active">选择候选</button>
-          <button id="cicAddModeBtn">人工添加 CIC</button>
-          <button id="cicPanModeBtn">拖拽图片</button>
-        </div>
-        <div class="selection-actions cic-actions">
-          <span id="cicSelectionHint">选择候选后确认类型；黄色候选不计入最终结果</span>
-          <button id="confirmHeterotypicBtn" class="class cyan">确认异质</button>
-          <button id="confirmHomotypicBtn" class="class amber">确认同质</button>
-          <button id="rejectCicBtn">排除</button>
-          <button id="deleteCicBtn" class="danger">删除</button>
-        </div>
-      </div>
-
       <div class="results-panel">
         <div class="panel-heading">
           <div><span class="eyebrow">RESULTS</span><h3>批量结果</h3></div>
@@ -162,7 +145,7 @@
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>实验组 / 视野</th><th id="resultHeaderDapi">DAPI</th><th id="resultHeaderNk">NK</th><th id="resultHeaderTumor">肿瘤</th><th>异质 CIC</th><th>同质 CIC</th><th>待复核</th><th>修正</th><th>处理进度</th></tr></thead>
+            <thead><tr><th>实验组 / 视野</th><th id="resultHeaderDapi">DAPI</th><th id="resultHeaderNk">NK</th><th id="resultHeaderTumor">肿瘤</th><th id="resultHeaderDapiMinusNk">DAPI-NK</th><th>修正</th><th>处理进度</th></tr></thead>
             <tbody id="resultsBody"></tbody>
           </table>
         </div>
@@ -207,13 +190,15 @@
           <label class="particle-only">最大圆度<input id="maxCircularity" type="number" min="0" max="1" step="0.01"></label>
           <label class="particle-only">平滑半径<input id="gaussianSigma" type="number" min="0" max="5" step="1"></label>
           <label class="particle-only">分水岭抑制 <small>越大切得越少</small><input id="watershedDistance" type="number" min="1"></label>
-          <label class="guided-only hidden">信号阈值 <small>背景校正后</small><input id="signalThreshold" type="number" min="0" max="255"></label>
+          <label class="guided-only hidden">最小信号差 <small>高于局部背景</small><input id="signalThreshold" type="number" min="0" max="255"></label>
           <label class="guided-only hidden">阳性像素比例<input id="positiveFraction" type="number" min="0" max="1" step="0.01"></label>
-          <label class="guided-only hidden">核周半径 <small>px</small><input id="ringRadius" type="number" min="0" max="100"></label>
+          <label class="guided-only hidden">核周范围 <small>µm</small><input id="ringRadiusUm" type="number" min="0" max="30" step="0.1"></label>
+          <label class="guided-only hidden">MAD 倍数 <small>抑制高背景</small><input id="signalMadMultiplier" type="number" min="0" max="12" step="0.1"></label>
+          <label class="guided-only hidden">最小连通信号块 <small>µm²</small><input id="minSignalBlockUm2" type="number" min="0" max="100" step="0.1"></label>
         </div>
         <p id="areaConversion" class="parameter-note particle-only">400 px² ≈ 19.0 µm²</p>
         <p class="parameter-note particle-only">核被切碎时调高；粘连核未拆开时调低。建议先在 8–16 之间微调。</p>
-        <p class="parameter-note guided-only hidden">先用第一通道分核，再统计核及核周的背景校正信号；降低阈值或阳性比例会计入更多细胞。若第一通道已计数，会复用其结果和人工修正。</p>
+        <p class="parameter-note guided-only hidden">复用第一通道的细胞核，按实际物理距离检查核周信号；背景用局部中位数＋MAD 稳健校正，会排除邻近细胞核并过滤零散噪点。轮廓显示的是真实阳性信号块，编号与 DAPI 核保持一致。</p>
       </details>
 
       <button class="button sample-button" id="randomSampleBtn">随机抽取当前组一张预跑</button>
@@ -237,48 +222,6 @@
         <button id="cancelBtn">停止批处理</button>
       </div>
       <p id="calibrationWarning" class="calibration-warning">推荐顺序：选择 DAPI → 随机预跑 → 保存阈值 → 批量；然后对 NK、肿瘤分别重复。三类参数互不覆盖。</p>
-      <details id="cicPanel" class="cic-panel">
-        <summary><span><span class="dot amber"></span>CIC 候选筛查与复核</span><small id="cicPrerequisiteBadge">当前视野 0/3</small></summary>
-        <p class="parameter-note cic-workflow-note">仅在完成 DAPI、NK、肿瘤三类计数后使用。自动结果只作为二维候选，必须人工确认后才计入同质或异质 CIC。</p>
-        <div class="fields">
-          <label class="full">异质 CIC 判定策略<select id="cicEvidenceProfile"><option value="ppt_annotated">标注 PPT 增强判定（推荐）</option><option value="strict_complete">仅完整包围（更保守）</option></select></label>
-          <label>最小包围比例<input id="cicMinCoverage" type="number" min="0.25" max="1" step="0.01" value="0.55"></label>
-          <label>红色环宽 <small>px</small><input id="cicRingWidth" type="number" min="8" max="120" value="36"></label>
-          <label>环/内部最小差异<input id="cicMinContrast" type="number" min="-0.5" max="1" step="0.01" value="0.05"></label>
-          <label>单图最多候选<input id="cicMaxCandidates" type="number" min="10" max="1000" value="200"></label>
-          <label class="full check-field"><input id="cicHomotypicEnabled" type="checkbox" checked> 同时筛查同质 CIC 候选（肿瘤–肿瘤，判定更保守）</label>
-        </div>
-        <button class="button ghost full cic-ppt-preset" id="cicPptPresetBtn">应用到当前实验组：CIC 标注 PPT 推荐参数</button>
-        <p class="parameter-note">增强判定会排除核坐标重合的假双阳性，并联合检查红色信号的象限覆盖、对侧支持、最大连续缺口及内外两层一致性。A 级接近完整包围，B 级为标注中常见的部分包围；两级都必须人工确认。</p>
-        <div class="cic-count-cards">
-          <article class="hetero"><span>异质 CIC</span><strong id="countCicHeterotypic">—</strong></article>
-          <article class="homo"><span>同质 CIC</span><strong id="countCicHomotypic">—</strong></article>
-          <article class="pending"><span>待复核候选</span><strong id="countCicPending">—</strong></article>
-          <article><span>CIC 状态</span><strong id="countCicStatus">未分析</strong></article>
-        </div>
-        <section class="cic-learning-panel" aria-label="CIC 本地学习">
-          <div class="cic-learning-head">
-            <div><span>本地主动学习</span><strong id="cicLearningStatus">等待人工标记</strong></div>
-            <label class="learning-switch"><input id="cicLearningEnabled" type="checkbox" checked>用于候选排序</label>
-          </div>
-          <div class="cic-learning-stats">
-            <span><b id="cicLearningPositive">0</b> 个 CIC 正例</span>
-            <span><b id="cicLearningNegative">0</b> 个排除反例</span>
-          </div>
-          <p>确认 CIC、排除假阳性和人工补充漏检都会保存在本机。同一 CIC 类型的正反例各达到 3 个后，模型会扩展并重排后续候选，但不会自动计入最终结果。</p>
-          <div class="cic-learning-actions">
-            <button id="exportCicLearningBtn">导出学习数据</button>
-            <label>导入学习数据<input id="importCicLearningInput" type="file" accept=".json"></label>
-            <button id="resetCicLearningBtn" class="danger">清空本机学习</button>
-          </div>
-        </section>
-        <div class="batch-actions">
-          <button class="button primary" id="analyzeCicCurrentBtn">筛查当前图片 CIC</button>
-          <button class="button ghost" id="analyzeCicGroupBtn">批量当前组 CIC</button>
-          <button class="button ghost full" id="analyzeCicAllBtn">批量已选文件夹 CIC</button>
-          <button class="button ghost full" id="reviewPendingCicBtn">跳到下一个待复核候选</button>
-        </div>
-      </details>
     </aside>
   </main>
 
@@ -302,7 +245,7 @@
           <select id="compareLeftView" aria-label="左侧视野"></select>
           <select id="compareLeftChannel" aria-label="左侧通道">
             <option value="overlay">合并图</option><option value="dapi">DAPI</option>
-            <option value="nk">NK</option><option value="tumor">肿瘤</option><option value="cic">CIC 标注</option>
+            <option value="nk">NK</option><option value="tumor">肿瘤</option>
           </select>
           <span id="compareLeftZoom">100%</span>
         </div>
@@ -319,7 +262,7 @@
           <select id="compareRightView" aria-label="右侧视野"></select>
           <select id="compareRightChannel" aria-label="右侧通道">
             <option value="overlay">合并图</option><option value="dapi">DAPI</option>
-            <option value="nk">NK</option><option value="tumor">肿瘤</option><option value="cic">CIC 标注</option>
+            <option value="nk">NK</option><option value="tumor">肿瘤</option>
           </select>
           <span id="compareRightZoom">100%</span>
         </div>
@@ -335,6 +278,6 @@
     <footer class="compare-help">滚轮缩放 · 左键拖拽 · 双击适应窗口；同步模式按相同图像坐标对齐，适合比较同尺寸视野。</footer>
   </section>
   <script src="static/vendor/UTIF.min.js"></script>
-  <script src="browser-app.js?v=20260802-exportzip1"></script>
+  <script src="browser-app.js?v=20260830-counting2"></script>
 </body>
 </html>

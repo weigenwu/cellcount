@@ -101,6 +101,25 @@ function thresholdMask(data, params) {
   return mask;
 }
 
+function scaleBarRegion(data,width,height) {
+  const x0=Math.floor(width*.92),y0=Math.floor(height*.98);
+  const minRun=Math.max(8,Math.floor(width*.025));
+  for(let y=y0;y<height;y++){
+    let run=0;
+    for(let x=x0;x<width;x++){
+      run=data[y*width+x]>=240?run+1:0;
+      if(run>=minRun)return{x0,y0,x1:width-1,y1:height-1};
+    }
+  }
+  return null;
+}
+
+function clearRegion(mask,region,width) {
+  if(!region)return mask;
+  for(let y=region.y0;y<=region.y1;y++)mask.fill(0,y*width+region.x0,y*width+region.x1+1);
+  return mask;
+}
+
 function opening(mask, width, height, iterations) {
   iterations = Math.max(0, Math.min(2, Math.round(iterations)));
   let current = mask;
@@ -308,34 +327,117 @@ function attachMaskRuns(labels, width, height, detections) {
   for (const detection of detections) delete detection._label;
 }
 
-function positivity(signal, width, height, detection, radiusPx, threshold) {
-  const innerRadius = detection.radius + radiusPx;
-  const bgStart = innerRadius + Math.max(2, radiusPx);
-  const bgEnd = bgStart + Math.max(4, radiusPx);
-  const x0 = Math.max(0, Math.floor(detection.x - bgEnd));
-  const x1 = Math.min(width - 1, Math.ceil(detection.x + bgEnd));
-  const y0 = Math.max(0, Math.floor(detection.y - bgEnd));
-  const y1 = Math.min(height - 1, Math.ceil(detection.y + bgEnd));
-  const inner = [], background = [];
-  const inner2 = innerRadius ** 2, bgStart2 = bgStart ** 2, bgEnd2 = bgEnd ** 2;
-  for (let y = y0; y <= y1; y++) {
-    for (let x = x0; x <= x1; x++) {
-      const d2 = (x - detection.x) ** 2 + (y - detection.y) ** 2;
-      const value = signal[y * width + x];
-      if (d2 <= inner2) inner.push(value);
-      else if (d2 >= bgStart2 && d2 <= bgEnd2) background.push(value);
+function median(values) {
+  if(!values.length)return 0;
+  values.sort((a,b)=>a-b);
+  const middle=Math.floor(values.length/2);
+  return values.length%2?values[middle]:(values[middle-1]+values[middle])/2;
+}
+
+function nucleusOwners(nuclei,width,height) {
+  const owners=new Uint16Array(width*height);
+  nuclei.forEach((nucleus,index)=>{
+    const label=index+1;
+    if(nucleus.runs?.length){
+      for(let run=0;run<nucleus.runs.length;run+=3){
+        const y=nucleus.runs[run],start=Math.max(0,nucleus.runs[run+1]),end=Math.min(width-1,nucleus.runs[run+2]);
+        if(y<0||y>=height)continue;
+        for(let x=start;x<=end;x++)owners[y*width+x]=label;
+      }
+      return;
+    }
+    const radius=Math.max(2,Number(nucleus.radius)||8),x0=Math.max(0,Math.floor(nucleus.x-radius)),x1=Math.min(width-1,Math.ceil(nucleus.x+radius));
+    const y0=Math.max(0,Math.floor(nucleus.y-radius)),y1=Math.min(height-1,Math.ceil(nucleus.y+radius)),radius2=radius*radius;
+    for(let y=y0;y<=y1;y++)for(let x=x0;x<=x1;x++)if((x-nucleus.x)**2+(y-nucleus.y)**2<=radius2)owners[y*width+x]=label;
+  });
+  return owners;
+}
+
+function connectedSignalRuns(mask,width,height,offsetX,offsetY,minBlock) {
+  const visited=new Uint8Array(mask.length),accepted=new Uint8Array(mask.length),queue=[];
+  let acceptedPixels=0;
+  for(let y=0;y<height;y++)for(let x=0;x<width;x++){
+    const start=y*width+x;
+    if(!mask[start]||visited[start])continue;
+    const component=[];queue.length=0;queue.push(start);visited[start]=1;
+    for(let head=0;head<queue.length;head++){
+      const index=queue[head],px=index%width,py=Math.floor(index/width);component.push(index);
+      for(let oy=-1;oy<=1;oy++)for(let ox=-1;ox<=1;ox++){
+        if(!ox&&!oy)continue;
+        const nx=px+ox,ny=py+oy;
+        if(nx<0||nx>=width||ny<0||ny>=height)continue;
+        const next=ny*width+nx;
+        if(mask[next]&&!visited[next]){visited[next]=1;queue.push(next);}
+      }
+    }
+    if(component.length<minBlock)continue;
+    acceptedPixels+=component.length;
+    for(const index of component)accepted[index]=1;
+  }
+  const runs=[];
+  for(let y=0;y<height;y++){
+    let x=0;
+    while(x<width){
+      while(x<width&&!accepted[y*width+x])x++;
+      if(x>=width)break;
+      const start=x++;
+      while(x<width&&accepted[y*width+x])x++;
+      runs.push(y+offsetY,start+offsetX,x-1+offsetX);
     }
   }
-  background.sort((a, b) => a - b);
-  const baseline = background.length ? background[Math.floor(background.length / 2)] : 0;
-  let positive = 0;
-  for (const value of inner) if (value - baseline >= threshold) positive++;
-  return {fraction: inner.length ? positive / inner.length : 0, background: baseline};
+  return{runs,pixels:acceptedPixels};
+}
+
+function robustPositivity(signal,width,height,nucleus,nucleusIndex,nuclei,owners,params,pixelSizeUm,scaleBar) {
+  const legacyPx=Math.max(0,Number(params.ring_radius_px)||0);
+  const ringUm=params.ring_radius_um;
+  const ringPx=ringUm!==null&&ringUm!==undefined&&ringUm!==""&&Number.isFinite(Number(ringUm))&&Number(ringUm)>=0
+    ? Number(ringUm)/pixelSizeUm:legacyPx;
+  const outerRadius=Math.max(2,Number(nucleus.radius)||8)+ringPx;
+  const bgGap=.75/pixelSizeUm,bgWidth=3/pixelSizeUm,bgStart=outerRadius+bgGap,bgEnd=bgStart+bgWidth;
+  const x0=Math.max(0,Math.floor(nucleus.x-bgEnd)),x1=Math.min(width-1,Math.ceil(nucleus.x+bgEnd));
+  const y0=Math.max(0,Math.floor(nucleus.y-bgEnd)),y1=Math.min(height-1,Math.ceil(nucleus.y+bgEnd));
+  const outer2=outerRadius**2,bgStart2=bgStart**2,bgEnd2=bgEnd**2,ownLabel=nucleusIndex+1;
+  const neighbours=nuclei.filter((other,index)=>index!==nucleusIndex&&Math.hypot(other.x-nucleus.x,other.y-nucleus.y)<bgEnd+(Number(other.radius)||8));
+  const candidate=[],background=[];
+  for(let y=y0;y<=y1;y++)for(let x=x0;x<=x1;x++){
+    if(scaleBar&&x>=scaleBar.x0&&y>=scaleBar.y0)continue;
+    const dx=x-nucleus.x,dy=y-nucleus.y,d2=dx*dx+dy*dy,index=y*width+x,owner=owners[index];
+    if(d2<=outer2){
+      if(owner&&owner!==ownLabel)continue;
+      if(neighbours.some(other=>(x-other.x)**2+(y-other.y)**2<d2))continue;
+      candidate.push(index);
+    }else if(d2>=bgStart2&&d2<=bgEnd2&&!owner&&
+      !neighbours.some(other=>(x-other.x)**2+(y-other.y)**2<d2))background.push(signal[index]);
+  }
+  const fallbackBackground=background.length?background:candidate
+    .map(index=>signal[index])
+    .sort((a,b)=>a-b)
+    .slice(0,Math.max(1,Math.ceil(candidate.length*.25)));
+  const baseline=median(fallbackBackground);
+  const mad=median(fallbackBackground.map(value=>Math.abs(value-baseline)));
+  const delta=Math.max(Number(params.signal_threshold)||0,(Number(params.signal_mad_multiplier)||0)*1.4826*mad);
+  const signalX0=Math.max(0,Math.floor(nucleus.x-outerRadius)),signalX1=Math.min(width-1,Math.ceil(nucleus.x+outerRadius));
+  const signalY0=Math.max(0,Math.floor(nucleus.y-outerRadius)),signalY1=Math.min(height-1,Math.ceil(nucleus.y+outerRadius));
+  const localWidth=signalX1-signalX0+1,localHeight=signalY1-signalY0+1;
+  const positiveMask=new Uint8Array(localWidth*localHeight);
+  for(const index of candidate)if(signal[index]-baseline>=delta){
+    const x=index%width,y=Math.floor(index/width);
+    positiveMask[(y-signalY0)*localWidth+x-signalX0]=1;
+  }
+  const minBlock=Math.max(1,Math.ceil((Number(params.min_signal_block_um2)||0)/(pixelSizeUm**2)));
+  const accepted=connectedSignalRuns(positiveMask,localWidth,localHeight,signalX0,signalY0,minBlock);
+  return{
+    fraction:candidate.length?accepted.pixels/candidate.length:0,
+    background:baseline,mad,threshold:baseline+delta,
+    runs:accepted.runs,areaPx:accepted.pixels,ringRadiusPx:ringPx,
+  };
 }
 
 function segmentParticles(data, width, height, params) {
   const smoothed = boxBlur(data, width, height, params.gaussian_sigma);
   let mask = thresholdMask(smoothed, params);
+  mask = clearRegion(mask,scaleBarRegion(data,width,height),width);
   mask = opening(mask, width, height, params.opening_radius);
   const distance = distanceTransform(mask, width, height);
   const seeds = selectSeeds(mask, distance, width, height, params.watershed_min_distance);
@@ -344,331 +446,6 @@ function segmentParticles(data, width, height, params) {
   const detections = regionDetections(labels, width, height, params);
   attachMaskRuns(labels, width, height, detections);
   return detections;
-}
-
-function histogramQuantile(data,quantile,ignoreZero=true) {
-  const histogram=new Uint32Array(256);
-  let total=0;
-  for(const value of data){
-    if(ignoreZero&&value===0)continue;
-    histogram[value]++;total++;
-  }
-  if(!total)return 255;
-  const target=Math.max(0,Math.min(total-1,Math.floor(total*quantile)));
-  let count=0;
-  for(let value=0;value<256;value++){
-    count+=histogram[value];
-    if(count>target)return value;
-  }
-  return 255;
-}
-
-function enclosureMetrics(red,width,height,detection,params,redThreshold) {
-  const innerRadius=Math.max(7,Number(detection.radius)||12);
-  const ringWidth=Math.max(8,Number(params.ring_width_px)||36);
-  const outerRadius=innerRadius+ringWidth;
-  const x0=Math.max(0,Math.floor(detection.x-outerRadius));
-  const x1=Math.min(width-1,Math.ceil(detection.x+outerRadius));
-  const y0=Math.max(0,Math.floor(detection.y-outerRadius));
-  const y1=Math.min(height-1,Math.ceil(detection.y+outerRadius));
-  const sectorCount=16;
-  const sectorPixels=new Uint32Array(sectorCount);
-  const sectorPositive=new Uint32Array(sectorCount);
-  const nearPixels=new Uint32Array(sectorCount);
-  const nearPositive=new Uint32Array(sectorCount);
-  const farPixels=new Uint32Array(sectorCount);
-  const farPositive=new Uint32Array(sectorCount);
-  let ringSum=0,ringPixels=0,innerSum=0,innerPixels=0;
-  const inner2=(innerRadius*.8)**2;
-  const ringStart2=(innerRadius*1.05)**2;
-  const middle2=(innerRadius+ringWidth*.52)**2;
-  const outer2=outerRadius**2;
-  for(let y=y0;y<=y1;y++){
-    for(let x=x0;x<=x1;x++){
-      const dx=x-detection.x,dy=y-detection.y,d2=dx*dx+dy*dy;
-      const value=red[y*width+x];
-      if(d2<=inner2){innerSum+=value;innerPixels++;continue;}
-      if(d2<ringStart2||d2>outer2)continue;
-      let angle=Math.atan2(dy,dx);
-      if(angle<0)angle+=Math.PI*2;
-      const sector=Math.min(sectorCount-1,Math.floor(angle/(Math.PI*2)*sectorCount));
-      sectorPixels[sector]++;ringPixels++;ringSum+=value;
-      if(d2<=middle2){
-        nearPixels[sector]++;
-        if(value>=redThreshold)nearPositive[sector]++;
-      }else{
-        farPixels[sector]++;
-        if(value>=redThreshold)farPositive[sector]++;
-      }
-      if(value>=redThreshold)sectorPositive[sector]++;
-    }
-  }
-  let enclosedSectors=0;
-  const requiredFraction=Math.max(.02,Number(params.sector_positive_fraction)||.18);
-  const flags=[],nearFlags=[],farFlags=[];
-  for(let sector=0;sector<sectorCount;sector++){
-    const positive=Boolean(sectorPixels[sector]&&sectorPositive[sector]/sectorPixels[sector]>=requiredFraction);
-    const near=Boolean(nearPixels[sector]&&nearPositive[sector]/nearPixels[sector]>=requiredFraction);
-    const far=Boolean(farPixels[sector]&&farPositive[sector]/farPixels[sector]>=requiredFraction);
-    flags.push(positive);nearFlags.push(near);farFlags.push(far);
-    if(positive)enclosedSectors++;
-  }
-  let oppositePairs=0,radialSectors=0;
-  for(let sector=0;sector<sectorCount/2;sector++){
-    if(flags[sector]&&flags[sector+sectorCount/2])oppositePairs++;
-  }
-  for(let sector=0;sector<sectorCount;sector++){
-    if(nearFlags[sector]&&farFlags[sector])radialSectors++;
-  }
-  let quadrantCount=0;
-  for(let quadrant=0;quadrant<4;quadrant++){
-    if(flags.slice(quadrant*4,quadrant*4+4).some(Boolean))quadrantCount++;
-  }
-  let largestGap=0,currentGap=0;
-  for(let index=0;index<sectorCount*2;index++){
-    if(flags[index%sectorCount])currentGap=0;
-    else{currentGap++;largestGap=Math.max(largestGap,Math.min(currentGap,sectorCount));}
-  }
-  const ringMean=ringPixels?ringSum/ringPixels:0;
-  const innerMean=innerPixels?innerSum/innerPixels:0;
-  return {
-    coverage:enclosedSectors/sectorCount,
-    contrast:(ringMean-innerMean)/(ringMean+10),
-    oppositePairs,quadrantCount,largestGap,
-    radialCoherence:radialSectors/sectorCount,
-    nearCoverage:nearFlags.filter(Boolean).length/sectorCount,
-    farCoverage:farFlags.filter(Boolean).length/sectorCount,
-    ringMean,innerMean,innerRadius,outerRadius,
-  };
-}
-function nearestHostDetection(origin,detections,metrics,params,excludeId=null) {
-  let best=null,bestDistance=Infinity;
-  for(const item of detections){
-    if(item.id===excludeId)continue;
-    const distance=Math.hypot(item.x-origin.x,item.y-origin.y);
-    const combinedRadius=Math.max(4,(Number(origin.radius)||12)+(Number(item.radius)||12));
-    const minimum=combinedRadius*Math.max(.35,Number(params.min_host_separation_factor)||.58);
-    const adaptiveMaximum=Math.min(
-      Math.max(20,Number(params.host_max_distance_px)||150),
-      metrics.outerRadius+(Number(item.radius)||12)*Math.max(1,Number(params.host_radius_allowance)||1.8)
-    );
-    if(distance<minimum||distance>adaptiveMaximum)continue;
-    if(distance<bestDistance){best=item;bestDistance=distance;}
-  }
-  return best?{item:best,distance:bestDistance}:null;
-}
-function heterotypicEvidence(metrics,params) {
-  const requested=Math.max(.25,Number(params.min_enclosure_coverage)||.55);
-  const strict=metrics.coverage>=Math.max(.8,requested)
-    &&metrics.contrast>=params.min_ring_contrast
-    &&metrics.oppositePairs>=3&&metrics.quadrantCount===4
-    &&metrics.largestGap<=3&&metrics.radialCoherence>=.44;
-  const annotated=params.evidence_profile!=="strict_complete"
-    &&metrics.coverage>=requested
-    &&metrics.contrast>=params.min_ring_contrast
-    &&metrics.oppositePairs>=2&&metrics.quadrantCount>=3
-    &&metrics.largestGap<=6&&metrics.radialCoherence>=.25;
-  if(strict)return{pass:true,grade:"A",rule:"complete_multidirectional_enclosure"};
-  if(annotated)return{pass:true,grade:"B",rule:"ppt_annotated_partial_enclosure"};
-  return{pass:false,grade:"",rule:"insufficient_multidirectional_enclosure"};
-}
-function cicConfidence(metrics,hostDistance,params,type,grade="A",areaRatio=1) {
-  const minCoverage=type==="homotypic"?params.homotypic_min_coverage:params.min_enclosure_coverage;
-  const coverageScore=Math.max(0,Math.min(1,(metrics.coverage-minCoverage)/(1-minCoverage+.001)));
-  const contrastScore=Math.max(0,Math.min(1,(metrics.contrast-params.min_ring_contrast)/.45));
-  const proximityScore=Math.max(0,1-hostDistance/Math.max(1,params.host_max_distance_px));
-  const morphologyScore=Math.min(1,
-    metrics.oppositePairs/5*.3+metrics.quadrantCount/4*.2+
-    (1-metrics.largestGap/16)*.2+metrics.radialCoherence*.3
-  );
-  const sizeScore=Math.max(0,Math.min(1,1/Math.max(1,areaRatio)));
-  const gradeBase=grade==="A"?.48:.39;
-  return Math.min(.99,gradeBase+.17*coverageScore+.13*contrastScore+.1*proximityScore+.09*morphologyScore+.04*sizeScore);
-}
-function cicLearningVector(event) {
-  const clamp=value=>Math.max(0,Math.min(1,Number(value)||0));
-  const required=[
-    "enclosure_coverage","ring_contrast","opposite_pairs","quadrant_count",
-    "largest_gap_sectors","radial_coherence","near_coverage","far_coverage",
-    "host_distance_px","inner_host_area_ratio","inner_radius_typical_ratio"
-  ];
-  if(required.some(key=>event[key]==null||!Number.isFinite(Number(event[key]))))return null;
-  return [
-    clamp(event.enclosure_coverage),
-    clamp((Number(event.ring_contrast)+.25)/.75),
-    clamp(Number(event.opposite_pairs)/8),
-    clamp(Number(event.quadrant_count)/4),
-    clamp(1-Number(event.largest_gap_sectors)/16),
-    clamp(event.radial_coherence),
-    clamp(event.near_coverage),
-    clamp(event.far_coverage),
-    clamp(1-Number(event.host_distance_px)/180),
-    clamp(1-Number(event.inner_host_area_ratio)/2),
-    clamp(1-Math.abs(Number(event.inner_radius_typical_ratio)-1)/1.5),
-  ];
-}
-function cicLearningScore(event,model) {
-  if(!model?.active||!Array.isArray(model.samples))return null;
-  const vector=cicLearningVector(event);
-  if(!vector)return null;
-  const distances=model.samples.map(sample=>{
-    const distance=Math.sqrt(vector.reduce((sum,value,index)=>sum+(value-Number(sample.vector[index]||0))**2,0));
-    return{distance,label:Number(sample.label)===1?1:0};
-  }).sort((a,b)=>a.distance-b.distance).slice(0,Math.min(7,model.samples.length));
-  let positive=0,total=0;
-  for(const item of distances){
-    const weight=1/(item.distance+.08);
-    positive+=weight*item.label;total+=weight;
-  }
-  return total?positive/total:null;
-}
-function median(values) {
-  if(!values.length)return 0;
-  const sorted=[...values].sort((a,b)=>a-b);
-  const middle=Math.floor(sorted.length/2);
-  return sorted.length%2?sorted[middle]:(sorted[middle-1]+sorted[middle])/2;
-}
-function analyzeCicCandidates(red,width,height,nkDetections,tumorDetections,params,learningModel={}) {
-  const redThreshold=Math.max(12,histogramQuantile(red,Number(params.red_quantile)||.72));
-  const events=[];
-  const typicalNkRadius=median(nkDetections.map(item=>Number(item.radius)||0).filter(value=>value>0));
-  for(const inner of nkDetections){
-    const innerSizeRatio=typicalNkRadius?(Number(inner.radius)||12)/typicalNkRadius:1;
-    if(!inner.manual&&innerSizeRatio>Math.max(1.2,Number(params.max_inner_radius_factor)||1.8))continue;
-    const metrics=enclosureMetrics(red,width,height,inner,params,redThreshold);
-    const evidence=heterotypicEvidence(metrics,params);
-    if(!evidence.pass&&(metrics.coverage<.15||metrics.quadrantCount<2||metrics.radialCoherence<.08))continue;
-    const host=nearestHostDetection(inner,tumorDetections,metrics,params);
-    if(!host)continue;
-    const areaRatio=(Number(inner.area_px)||Math.PI*(inner.radius||12)**2)
-      /Math.max(1,Number(host.item.area_px)||Math.PI*(host.item.radius||12)**2);
-    if(areaRatio>Math.max(1,Number(params.max_inner_host_area_ratio)||1.5))continue;
-    const candidate={
-      id:`cic-auto-hetero-${events.length+1}`,
-      x:inner.x,y:inner.y,inner_radius:metrics.innerRadius,outer_radius:metrics.outerRadius,
-      outer_x:host.item.x,outer_y:host.item.y,
-      inner_cell_id:inner.id,outer_cell_id:host.item.id,
-      inner_cell_type:"nk",outer_cell_type:"tumor",
-      type_hint:"heterotypic",classification:"pending",
-      enclosure_coverage:metrics.coverage,ring_contrast:metrics.contrast,
-      evidence_grade:evidence.grade,evidence_rule:evidence.rule,
-      opposite_pairs:metrics.oppositePairs,quadrant_count:metrics.quadrantCount,
-      largest_gap_sectors:metrics.largestGap,radial_coherence:metrics.radialCoherence,
-      near_coverage:metrics.nearCoverage,far_coverage:metrics.farCoverage,
-      host_distance_px:host.distance,inner_host_area_ratio:areaRatio,
-      inner_radius_typical_ratio:innerSizeRatio,
-      inner_positive_fraction:Number(inner.positive_fraction)||null,
-      confidence:cicConfidence(metrics,host.distance,params,"heterotypic",evidence.grade,areaRatio),
-      red_threshold:redThreshold,source:"automatic_2d_candidate",manual:false,reviewed:false,deleted:false,
-    };
-    candidate.learning_score=cicLearningScore(candidate,learningModel.heterotypic);
-    if(!evidence.pass&&(candidate.learning_score==null||candidate.learning_score<.62))continue;
-    if(!evidence.pass){
-      candidate.evidence_grade="L";
-      candidate.evidence_rule="local_learning_recovered_candidate";
-      candidate.confidence=Math.max(candidate.confidence,candidate.learning_score);
-    }
-    events.push(candidate);
-  }
-  if(params.homotypic_enabled){
-    const pairs=new Map();
-    for(const inner of tumorDetections){
-      const metrics=enclosureMetrics(red,width,height,inner,params,redThreshold);
-      const strictPass=metrics.coverage>=params.homotypic_min_coverage&&metrics.contrast>=params.min_ring_contrast;
-      if(!strictPass&&(metrics.coverage<.2||metrics.quadrantCount<2))continue;
-      const host=nearestHostDetection(inner,tumorDetections,metrics,params,inner.id);
-      if(!host)continue;
-      const key=[inner.id,host.item.id].sort().join("|");
-      const areaRatio=(Number(inner.area_px)||Math.PI*(inner.radius||12)**2)
-        /Math.max(1,Number(host.item.area_px)||Math.PI*(host.item.radius||12)**2);
-      const candidate={
-        id:"",x:inner.x,y:inner.y,inner_radius:metrics.innerRadius,outer_radius:metrics.outerRadius,
-        outer_x:host.item.x,outer_y:host.item.y,
-        inner_cell_id:inner.id,outer_cell_id:host.item.id,
-        inner_cell_type:"tumor",outer_cell_type:"tumor",
-        type_hint:"homotypic",classification:"pending",
-        enclosure_coverage:metrics.coverage,ring_contrast:metrics.contrast,
-        evidence_grade:strictPass?"A":"L",evidence_rule:strictPass?"conservative_homotypic_enclosure":"local_learning_recovered_candidate",
-        opposite_pairs:metrics.oppositePairs,quadrant_count:metrics.quadrantCount,
-        largest_gap_sectors:metrics.largestGap,radial_coherence:metrics.radialCoherence,
-        near_coverage:metrics.nearCoverage,far_coverage:metrics.farCoverage,
-        host_distance_px:host.distance,inner_host_area_ratio:areaRatio,inner_radius_typical_ratio:1,
-        confidence:cicConfidence(metrics,host.distance,params,"homotypic",strictPass?"A":"B",areaRatio),
-        red_threshold:redThreshold,source:"automatic_2d_candidate",manual:false,reviewed:false,deleted:false,
-      };
-      candidate.learning_score=cicLearningScore(candidate,learningModel.homotypic);
-      const morphologyPass=host.item.circularity<=params.homotypic_host_max_circularity;
-      if((!strictPass||!morphologyPass)&&(candidate.learning_score==null||candidate.learning_score<.62))continue;
-      if(candidate.learning_score!=null)candidate.confidence=Math.max(candidate.confidence,candidate.learning_score);
-      if(!pairs.has(key)||candidate.confidence>pairs.get(key).confidence)pairs.set(key,candidate);
-    }
-    for(const candidate of pairs.values()){
-      candidate.id=`cic-auto-homo-${events.length+1}`;
-      events.push(candidate);
-    }
-  }
-  const gradeBonus=event=>event.evidence_grade==="A"?.05:event.evidence_grade==="B"?.025:0;
-  const learnedRank=event=>(event.learning_score==null
-    ? Number(event.confidence)||0
-    : .55*event.learning_score+.45*(Number(event.confidence)||0))+gradeBonus(event);
-  events.sort((a,b)=>learnedRank(b)-learnedRank(a));
-  const limit=Math.max(10,Math.round(params.max_candidates||200));
-  return events.slice(0,limit).map((event,index)=>({...event,id:`cic-auto-${index+1}`}));
-}
-function nearestToPoint(point,detections,maxDistance=110) {
-  let best=null,distance=Infinity;
-  for(const item of detections){
-    const current=Math.hypot(item.x-point.x,item.y-point.y);
-    if(current<distance&&current<=maxDistance){best=item;distance=current;}
-  }
-  return best;
-}
-function describeManualProfile(red,width,height,innerDetections,hostDetections,point,params,type) {
-  const inner=nearestToPoint(point,innerDetections);
-  if(!inner)return null;
-  const redThreshold=Math.max(12,histogramQuantile(red,Number(params.red_quantile)||.72));
-  const metrics=enclosureMetrics(red,width,height,inner,params,redThreshold);
-  const host=nearestHostDetection(inner,hostDetections,metrics,{...params,min_host_separation_factor:.2},type==="homotypic"?inner.id:null);
-  if(!host)return null;
-  const areaRatio=(Number(inner.area_px)||Math.PI*(inner.radius||12)**2)
-    /Math.max(1,Number(host.item.area_px)||Math.PI*(host.item.radius||12)**2);
-  return {
-    x:inner.x,y:inner.y,inner_radius:metrics.innerRadius,outer_radius:metrics.outerRadius,
-    outer_x:host.item.x,outer_y:host.item.y,
-    inner_cell_id:inner.id,outer_cell_id:host.item.id,
-    inner_cell_type:type==="homotypic"?"tumor":"nk",outer_cell_type:"tumor",
-    type_hint:type,enclosure_coverage:metrics.coverage,ring_contrast:metrics.contrast,
-    opposite_pairs:metrics.oppositePairs,quadrant_count:metrics.quadrantCount,
-    largest_gap_sectors:metrics.largestGap,radial_coherence:metrics.radialCoherence,
-    near_coverage:metrics.nearCoverage,far_coverage:metrics.farCoverage,
-    host_distance_px:host.distance,inner_host_area_ratio:areaRatio,
-    inner_radius_typical_ratio:1,red_threshold:redThreshold,
-  };
-}
-
-async function analyzeCic(payload) {
-  postProgress("读取肿瘤通道并计算红色包围结构",.12);
-  const red=await decode(payload.redBuffer,payload.redExtension,"tumor");
-  postProgress("筛查 NK–肿瘤异质 CIC 候选",.42);
-  const events=analyzeCicCandidates(
-    red.data,red.width,red.height,
-    Array.isArray(payload.nkDetections)?payload.nkDetections:[],
-    Array.isArray(payload.tumorDetections)?payload.tumorDetections:[],
-    {...payload.params},payload.learningModel||{}
-  );
-  postProgress("生成待人工复核 CIC 列表",.96);
-  return {events,width:red.width,height:red.height};
-}
-async function describeManualCic(payload) {
-  const red=await decode(payload.redBuffer,payload.redExtension,"tumor");
-  const nk=Array.isArray(payload.nkDetections)?payload.nkDetections:[];
-  const tumor=Array.isArray(payload.tumorDetections)?payload.tumorDetections:[];
-  return {
-    profiles:{
-      heterotypic:describeManualProfile(red.data,red.width,red.height,nk,tumor,payload.point,payload.params,"heterotypic"),
-      homotypic:describeManualProfile(red.data,red.width,red.height,tumor,tumor,payload.point,payload.params,"homotypic"),
-    }
-  };
 }
 
 async function analyze(payload) {
@@ -688,23 +465,33 @@ async function analyze(payload) {
       postProgress("分割第一通道细胞核", 0.34);
       nuclei = segmentParticles(anchor.data, width, height, payload.anchorParams);
     }
-    postProgress("计算核周背景校正信号", 0.68);
+    nuclei=nuclei.map((nucleus,index)=>({...nucleus,display_label:nucleus.display_label??index+1}));
+    const owners=nucleusOwners(nuclei,width,height);
+    const pixelSizeUm=Math.max(.001,Number(payload.pixelSizeUm)||1);
+    const scaleBar=scaleBarRegion(channel.data,width,height);
+    postProgress("计算核周局部中位数与 MAD 信号", 0.68);
     detections = [];
-    for (const nucleus of nuclei) {
-      const signal = positivity(
-        channel.data, width, height, nucleus,
-        payload.params.ring_radius_px, payload.params.signal_threshold
-      );
-      if (signal.fraction < payload.params.positive_fraction) continue;
-      detections.push({
+    for (let index=0;index<nuclei.length;index++) {
+      const nucleus=nuclei[index];
+      const signal=robustPositivity(channel.data,width,height,nucleus,index,nuclei,owners,payload.params,pixelSizeUm,scaleBar);
+      if (!signal.areaPx||signal.fraction < payload.params.positive_fraction) continue;
+      const detection={
         ...nucleus,
-        id:`auto-${detections.length + 1}`,
+        id:nucleus.id,
+        signal_runs:signal.runs,
+        area_px:signal.areaPx,
+        anchor_area_px:nucleus.area_px,
         manual:false,
         deleted:false,
         anchor_manual:Boolean(nucleus.manual),
         positive_fraction:signal.fraction,
         signal_background:signal.background,
-      });
+        signal_mad:signal.mad,
+        signal_threshold_actual:signal.threshold,
+        ring_radius_px_resolved:signal.ringRadiusPx,
+      };
+      delete detection.runs;
+      detections.push(detection);
     }
   } else {
     postProgress("平滑、阈值与自适应分水岭", 0.24);
@@ -721,11 +508,8 @@ async function analyze(payload) {
 
 onmessage = async event => {
   try {
-    let result;
-    if(event.data.type==="analyze")result=await analyze(event.data);
-    else if(event.data.type==="analyze_cic")result=await analyzeCic(event.data);
-    else if(event.data.type==="describe_manual_cic")result=await describeManualCic(event.data);
-    else return;
+    if(event.data.type!=="analyze")return;
+    const result=await analyze(event.data);
     postMessage({type: "result", ...result});
   } catch (error) {
     postMessage({type: "error", error: error.message || String(error)});
