@@ -117,7 +117,7 @@ button { color: inherit; }
 .results-panel { padding: 18px; }
 .panel-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
 .panel-heading h3 { margin: 4px 0 0; font-size: 16px; }
-.results-actions { display: flex; gap: 7px; align-items: center; }
+.results-actions { display: flex; gap: 7px; align-items: center; justify-content: flex-end; flex-wrap: wrap; }
 .check { color: var(--muted); font-size: 10px; margin-right: 8px; }
 .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
 table { width: 100%; border-collapse: collapse; font-size: 10px; }

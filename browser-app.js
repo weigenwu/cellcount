@@ -1,5 +1,5 @@
 /* global UTIF */
-const APP_ASSET_VERSION = "20260830-counting2";
+const APP_ASSET_VERSION = "20260831-xlsx1";
 const DEFAULTS = {
   threshold_mode: "manual", threshold_low: 15, threshold_high: 255,
   gaussian_sigma: 1, opening_radius: 1, watershed_min_distance: 12,
@@ -800,6 +800,7 @@ function detectionAtPoint(point) {
   return best;
 }
 function handleCanvasClick(event) {
+  if(state.busy)return toast("正在分析或导出，请完成后再进行人工修正",true);
   if (state.mode==="pan") return;
   if (!targetResult(state.currentViewId)?.detections) return toast(`请先预跑当前视野的 ${targetLabel(state.target)}`);
   const point=canvasPoint(event);
@@ -829,10 +830,12 @@ function syncCorrections() {
   scheduleAutosave();
 }
 function reclassify(classification) {
+  if(state.busy)return toast("正在分析或导出，请完成后再进行人工修正",true);
   const item=state.detections.find(d=>d.id===state.selectedId); if(!item)return;
   item.classification=state.target;item.manual=true;syncCorrections();
 }
 function deleteSelected() {
+  if(state.busy)return toast("正在分析或导出，请完成后再进行人工修正",true);
   const item=state.detections.find(d=>d.id===state.selectedId);
   if(!item) return toast("请先选择要删除的细胞标记",true);
   pushHistory("cell");
@@ -951,12 +954,14 @@ async function restoreHistorySnapshot(snapshot) {
   updateCounts();renderResults();renderGroups();renderInspectionView();scheduleAutosave();
 }
 async function undoCorrection() {
+  if(state.busy)return toast("正在分析或导出，请完成后再撤销人工修正",true);
   const snapshot=state.undoStack.pop();
   if(!snapshot)return;
   state.redoStack.push(historySnapshot(snapshot.kind,snapshot.viewId,snapshot.target));
   await restoreHistorySnapshot(snapshot);updateHistoryButtons();toast("已撤销上一次人工修正");
 }
 async function redoCorrection() {
+  if(state.busy)return toast("正在分析或导出，请完成后再重做人工修正",true);
   const snapshot=state.redoStack.pop();
   if(!snapshot)return;
   state.undoStack.push(historySnapshot(snapshot.kind,snapshot.viewId,snapshot.target));
@@ -1089,6 +1094,173 @@ class BrowserZipArchive {
     return new Blob([...this.parts,...central,end],{type:"application/zip"});
   }
 }
+const XLSX_MIME="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+function xlsxPlainText(value) {
+  let output="";
+  for(const character of String(value??"")){
+    const code=character.codePointAt(0);
+    if(code<=8||code===11||code===12||(code>=14&&code<=31)||code===0xfffe||code===0xffff)continue;
+    output+=(code>=0xd800&&code<=0xdfff)?"\ufffd":character;
+  }
+  return output;
+}
+function xlsxXml(value) {
+  return xlsxPlainText(value)
+    .replace(/_x[0-9a-f]{4}_/gi,match=>`_x005F_${match.slice(1)}`)
+    .replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
+    .replaceAll('"',"&quot;").replaceAll("'","&apos;");
+}
+function xlsxTruncate(value,limit) {
+  let output="",length=0;
+  for(const character of value){
+    if(length+character.length>limit)break;
+    output+=character;length+=character.length;
+  }
+  return output;
+}
+function xlsxSheetBase(value,limit=31) {
+  const cleaned=xlsxPlainText(value).replace(/[\\/?*\[\]:]/g,"_").trim();
+  return xlsxTruncate(cleaned,limit).replace(/^'+|'+$/g,"").trim()||"实验组";
+}
+function xlsxColumn(index) {
+  let output="";
+  for(let value=index+1;value;value=Math.floor((value-1)/26))output=String.fromCharCode(65+(value-1)%26)+output;
+  return output;
+}
+function xlsxSheetNames(groups) {
+  const key=value=>xlsxPlainText(value).normalize("NFC").toLocaleLowerCase(),used=new Set(["汇总","说明"].map(key)),names=new Map();
+  for(const group of groups){
+    let base=xlsxSheetBase(group);
+    if(/^history$/i.test(base))base="History_";
+    let name=base,suffix=2;
+    while(used.has(key(name))){
+      const tail=`_${suffix++}`;name=xlsxSheetBase(base,31-tail.length)+tail;
+    }
+    used.add(key(name));names.set(group,name);
+  }
+  return names;
+}
+function xlsxSheetRef(name) { return `'${String(name).replaceAll("'","''")}'`; }
+function xlsxCellXml(row,column,cell) {
+  const descriptor=cell&&typeof cell==="object"&&Object.hasOwn(cell,"value")?cell:{value:cell};
+  const value=descriptor.value,formula=descriptor.formula;
+  if(value==null&&!formula)return "";
+  const reference=`${xlsxColumn(column)}${row}`,style=descriptor.style?` s="${descriptor.style}"`:"";
+  if(formula){
+    const cached=Number.isFinite(Number(value))?`<v>${Number(value)}</v>`:"";
+    return `<c r="${reference}"${style}><f>${xlsxXml(String(formula).replace(/^=/,""))}</f>${cached}</c>`;
+  }
+  if(typeof value==="number"&&Number.isFinite(value))return `<c r="${reference}"${style}><v>${value}</v></c>`;
+  if(typeof value==="boolean")return `<c r="${reference}"${style} t="b"><v>${value?1:0}</v></c>`;
+  return `<c r="${reference}"${style} t="inlineStr"><is><t xml:space="preserve">${xlsxXml(value)}</t></is></c>`;
+}
+function xlsxRowXml(number,cells,height=null) {
+  const content=cells.map((cell,index)=>xlsxCellXml(number,index,cell)).join("");
+  return `<row r="${number}"${height?` ht="${height}" customHeight="1"`:""}>${content}</row>`;
+}
+function xlsxWorksheetXml({rows,columnWidths,dimension,freeze,merges=[],autoFilter=""}) {
+  const columns=columnWidths.map((width,index)=>`<col min="${index+1}" max="${index+1}" width="${width}" customWidth="1"/>`).join("");
+  const pane=freeze?`<pane${freeze.x?` xSplit="${freeze.x}"`:""}${freeze.y?` ySplit="${freeze.y}"`:""} topLeftCell="${freeze.topLeft}" activePane="${freeze.x&&freeze.y?"bottomRight":freeze.x?"topRight":"bottomLeft"}" state="frozen"/>`:"";
+  const merged=merges.length?`<mergeCells count="${merges.length}">${merges.map(ref=>`<mergeCell ref="${ref}"/>`).join("")}</mergeCells>`:"";
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="${dimension}"/><sheetViews><sheetView workbookViewId="0" showGridLines="1">${pane}</sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/><cols>${columns}</cols><sheetData>${rows.join("")}</sheetData>${autoFilter?`<autoFilter ref="${autoFilter}"/>`:""}${merged}<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/></worksheet>`;
+}
+function xlsxStylesXml() {
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="2"><numFmt numFmtId="164" formatCode="#,##0.0"/><numFmt numFmtId="165" formatCode="0.000"/></numFmts><fonts count="4"><font><sz val="11"/><color rgb="FF000000"/><name val="Calibri"/><family val="2"/></font><font><b/><sz val="16"/><color rgb="FF000000"/><name val="Calibri"/><family val="2"/></font><font><b/><sz val="11"/><color rgb="FF000000"/><name val="Calibri"/><family val="2"/></font><font><i/><sz val="11"/><color rgb="FF000000"/><name val="Calibri"/><family val="2"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="3"><border><left/><right/><top/><bottom/><diagonal/></border><border><left/><right/><top/><bottom style="thin"><color rgb="FFBFBFBF"/></bottom><diagonal/></border><border><left/><right/><top style="thin"><color rgb="FFBFBFBF"/></top><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="12"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment vertical="center"/></xf><xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="0" fontId="3" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment wrapText="1"/></xf><xf numFmtId="0" fontId="2" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf><xf numFmtId="3" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/><xf numFmtId="3" fontId="2" fillId="0" borderId="2" xfId="0" applyFont="1" applyBorder="1" applyNumberFormat="1"/><xf numFmtId="164" fontId="2" fillId="0" borderId="2" xfId="0" applyFont="1" applyBorder="1" applyNumberFormat="1"/><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="center" wrapText="1"/></xf><xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment vertical="center" wrapText="1"/></xf></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles><tableStyles count="0" defaultTableStyle="TableStyleMedium2" defaultPivotStyle="PivotStyleLight16"/></styleSheet>`;
+}
+function xlsxResultRecord(view) {
+  const counts=viewCounts(view.id),status=Object.fromEntries(TARGETS.map(target=>[target,targetStatus(view.id,target)]));
+  const values=Object.fromEntries(TARGETS.map(target=>[target,status[target]==="done"?counts[target].total:null]));
+  return{
+    view,counts,status,...values,
+    dapiMinusNk:values.dapi!=null&&values.nk!=null?values.dapi-values.nk:null,
+    corrected:counts.dapi.corrected+counts.nk.corrected+counts.tumor.corrected,
+    complete:TARGETS.every(target=>status[target]==="done"),
+    issue:Boolean(refreshViewError(view))||TARGETS.some(target=>status[target]!=="done"),
+  };
+}
+function xlsxSum(values) { return values.filter(Number.isFinite).reduce((sum,value)=>sum+value,0); }
+function xlsxMean(values) { const numbers=values.filter(Number.isFinite);return numbers.length?xlsxSum(numbers)/numbers.length:0; }
+function xlsxAggregate(values,style,formula,average=false) {
+  const numbers=values.filter(Number.isFinite);
+  return numbers.length?{value:average?xlsxMean(numbers):xlsxSum(numbers),style,formula}:null;
+}
+async function cellCountWorkbookBlob(processedGroups) {
+  const groupSheetNames=xlsxSheetNames(processedGroups),exportedAt=new Date();
+  const sheetModels=[],groupRecords=new Map(processedGroups.map(group=>[group,groupViews(group).map(xlsxResultRecord)]));
+  const labels={dapi:targetLabel("dapi"),nk:targetLabel("nk"),tumor:targetLabel("tumor")};
+  const summaryRows=[
+    xlsxRowXml(1,[{value:`${state.project.name} 细胞计数汇总`,style:1}],28),
+    xlsxRowXml(2,[{value:"网页当前计数结果；空白表示相应通道尚未完成，建议结合标注图复核。",style:3}],26),
+    xlsxRowXml(4,["文件夹","视野数","三通道完成",`${labels.dapi} 总数`,`${labels.nk} 总数`,`${labels.tumor} 总数`,`${labels.dapi}-${labels.nk} 总数`,`平均 ${labels.dapi}`,`平均 ${labels.nk}`,`平均 ${labels.tumor}`,"人工修正总数","错误/未完成视野"].map(value=>({value,style:4})),32),
+  ];
+  processedGroups.forEach((group,index)=>{
+    const records=groupRecords.get(group),row=5+index,first=6,last=5+records.length,sheet=xlsxSheetRef(groupSheetNames.get(group));
+    const dapi=records.map(record=>record.dapi),nk=records.map(record=>record.nk),tumor=records.map(record=>record.tumor),difference=records.map(record=>record.dapiMinusNk);
+    summaryRows.push(xlsxRowXml(row,[
+      {value:group,style:11},{value:records.length,style:5},{value:records.filter(record=>record.complete).length,style:5},
+      xlsxAggregate(dapi,5,`SUM(${sheet}!B${first}:B${last})`),
+      xlsxAggregate(nk,5,`SUM(${sheet}!C${first}:C${last})`),
+      xlsxAggregate(tumor,5,`SUM(${sheet}!D${first}:D${last})`),
+      xlsxAggregate(difference,5,`SUM(${sheet}!E${first}:E${last})`),
+      xlsxAggregate(dapi,6,`AVERAGE(${sheet}!B${first}:B${last})`,true),
+      xlsxAggregate(nk,6,`AVERAGE(${sheet}!C${first}:C${last})`,true),
+      xlsxAggregate(tumor,6,`AVERAGE(${sheet}!D${first}:D${last})`,true),
+      {value:xlsxSum(records.map(record=>record.corrected)),style:5},
+      {value:records.filter(record=>record.issue).length,style:5},
+    ]));
+  });
+  sheetModels.push({name:"汇总",xml:xlsxWorksheetXml({rows:summaryRows,columnWidths:[18,11,14,14,14,14,18,15,15,15,17,20],dimension:`A1:L${4+processedGroups.length}`,freeze:{x:1,y:4,topLeft:"B5"},merges:["A1:L1","A2:L2"],autoFilter:`A4:L${4+processedGroups.length}`})});
+  const processedViews=[...groupRecords.values()].flat(),noteRows=[
+    ["项目","内容","状态/参数","使用建议"],
+    ["导出范围",`${state.project.name}：${processedGroups.length} 个文件夹，共 ${processedViews.length} 个视野。`,`导出时间 ${exportedAt.toLocaleString("zh-CN")}`,"每个文件夹对应一个独立工作表。"],
+    ["通道映射","优先按 Leica XML 的 LUT 名称逐视野识别通道。","不固定假定 ch00/ch01/ch02。","请在汇总和组工作表查看缺失或错误状态。"],
+    [labels.dapi,"阈值分割后进行形态学清理、分水岭及面积/圆度过滤。","参数按文件夹独立保存。","正式统计前建议抽查标注轮廓。"],
+    [`${labels.nk}/${labels.tumor}`,`以 ${labels.dapi} 核为锚点，在核周区域评估背景校正信号。`,"红绿参数可分别调整。","人工修正会计入最终数量和修正数。"],
+    [`${labels.dapi}-${labels.nk}`,`按 ${labels.dapi} 总数减 ${labels.nk} 总数计算。`,"仅两个通道均完成时显示。","可与红色通道结果交叉核对。"],
+    ["人工修正","修正数包含人工添加、删除或修改。","原始自动结果和修正保存在项目 JSON。","完整导出同时保留逐对象 CSV 和标注图。"],
+    ["缺失/未完成","对应计数在 Excel 中留空，不自动写成 0。","状态和错误列保留原因。","补齐通道或完成分析后重新导出。"],
+    ["数据解释","自动计数是可重复的图像定量工具，不等同于生物学验证。","阈值需按实验校准。","低背景、高背景、密集和稀疏视野均应抽查。"],
+  ];
+  const notes=[xlsxRowXml(1,[{value:"结果说明与自动计数口径",style:1}],28),xlsxRowXml(3,noteRows[0].map(value=>({value,style:4})),28)];
+  noteRows.slice(1).forEach((row,index)=>notes.push(xlsxRowXml(4+index,row.map((value,column)=>({value,style:column===0?11:10})),45)));
+  sheetModels.push({name:"说明",xml:xlsxWorksheetXml({rows:notes,columnWidths:[18,58,38,48],dimension:`A1:D${2+noteRows.length}`,freeze:{y:3,topLeft:"A4"},merges:["A1:D1"]})});
+  const statusText={pending:"未分析",running:"分析中",done:"完成",error:"错误"};
+  for(const group of processedGroups){
+    const records=groupRecords.get(group),dataStart=6,dataEnd=5+records.length,totalRow=dataEnd+2,meanRow=dataEnd+3;
+    const rows=[
+      xlsxRowXml(1,[{value:`${group} — 逐视野细胞计数`,style:1}],28),
+      xlsxRowXml(2,[{value:`视野数：${records.length}　｜　通道按逐视野 XML/后缀映射　｜　导出：${exportedAt.toLocaleString("zh-CN")}`,style:2}],22),
+      xlsxRowXml(3,[{value:`${labels.dapi}-${labels.nk} 为 Excel 公式；空白表示相关通道尚未完成。人工修正数包含添加、删除或修改。`,style:3}],24),
+      xlsxRowXml(5,["视野",labels.dapi,labels.nk,labels.tumor,`${labels.dapi}-${labels.nk}`,`${labels.dapi}修正数`,`${labels.nk}修正数`,`${labels.tumor}修正数`,"修正总数",`${labels.dapi}状态`,`${labels.nk}状态`,`${labels.tumor}状态`,`${labels.dapi}文件`,`${labels.nk}/绿文件`,`${labels.tumor}/红文件`,"通道映射","像素大小 µm/px","错误/QC"].map(value=>({value,style:4})),34),
+    ];
+    records.forEach((record,index)=>{
+      const row=dataStart+index,files=record.view.fileNames||{};
+      rows.push(xlsxRowXml(row,[
+        {value:record.view.name,style:11},{value:record.dapi,style:5},{value:record.nk,style:5},{value:record.tumor,style:5},
+        record.dapiMinusNk==null?null:{value:record.dapiMinusNk,style:5,formula:`B${row}-C${row}`},
+        {value:record.counts.dapi.corrected,style:5},{value:record.counts.nk.corrected,style:5},{value:record.counts.tumor.corrected,style:5},{value:record.corrected,style:5},
+        {value:statusText[record.status.dapi],style:10},{value:statusText[record.status.nk],style:10},{value:statusText[record.status.tumor],style:10},
+        {value:files.dapi||"",style:10},{value:files.nk||"",style:10},{value:files.tumor||"",style:10},
+        {value:`${record.view.channel_mapping_source==="leica_xml"?"Leica XML":"手动后缀"}：${channelMappingText(record.view.channel_mapping)}`,style:10},
+        {value:record.view.pixel_size_um||state.project.pixel_size_um,style:7},{value:refreshViewError(record.view),style:10},
+      ]));
+    });
+    const valueColumns=[records.map(record=>record.dapi),records.map(record=>record.nk),records.map(record=>record.tumor),records.map(record=>record.dapiMinusNk),records.map(record=>record.counts.dapi.corrected),records.map(record=>record.counts.nk.corrected),records.map(record=>record.counts.tumor.corrected),records.map(record=>record.corrected)];
+    rows.push(xlsxRowXml(totalRow,[{value:"合计",style:11},...valueColumns.map((values,index)=>xlsxAggregate(values,8,`SUM(${xlsxColumn(index+1)}${dataStart}:${xlsxColumn(index+1)}${dataEnd})`))]));
+    rows.push(xlsxRowXml(meanRow,[{value:"均值",style:11},...valueColumns.map((values,index)=>xlsxAggregate(values,9,`AVERAGE(${xlsxColumn(index+1)}${dataStart}:${xlsxColumn(index+1)}${dataEnd})`,true))]));
+    sheetModels.push({name:groupSheetNames.get(group),xml:xlsxWorksheetXml({rows,columnWidths:[17,11,11,11,16,14,14,14,14,13,13,13,25,25,25,28,17,48],dimension:`A1:R${meanRow}`,freeze:{x:1,y:5,topLeft:"B6"},merges:["A1:R1","A2:R2","A3:R3"],autoFilter:`A5:R${dataEnd}`})});
+  }
+  const archive=new BrowserZipArchive(),sheetOverrides=sheetModels.map((_,index)=>`<Override PartName="/xl/worksheets/sheet${index+1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join("");
+  await archive.add("[Content_Types].xml",`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>${sheetOverrides}</Types>`);
+  await archive.add("_rels/.rels",`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`);
+  await archive.add("xl/workbook.xml",`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><bookViews><workbookView activeTab="0"/></bookViews><sheets>${sheetModels.map((sheet,index)=>`<sheet name="${xlsxXml(sheet.name)}" sheetId="${index+1}" r:id="rId${index+1}"/>`).join("")}</sheets><calcPr calcId="191029" fullCalcOnLoad="1" forceFullCalc="1"/></workbook>`);
+  await archive.add("xl/_rels/workbook.xml.rels",`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${sheetModels.map((_,index)=>`<Relationship Id="rId${index+1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${index+1}.xml"/>`).join("")}<Relationship Id="rId${sheetModels.length+1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`);
+  await archive.add("xl/styles.xml",xlsxStylesXml());
+  for(let index=0;index<sheetModels.length;index++)await archive.add(`xl/worksheets/sheet${index+1}.xml`,sheetModels[index].xml);
+  return new Blob([archive.finish()],{type:XLSX_MIME});
+}
 async function createDirectoryExportSink(parent,rootName) {
   const root=await parent.getDirectoryHandle(rootName,{create:true});
   const directories=new Map([["",root]]);
@@ -1208,6 +1380,7 @@ function cellRawCsv(views=state.project.views) {
 async function writeExportContents(sink,processedGroups) {
     const errors=[],processedViews=state.project.views.filter(view=>processedGroups.includes(view.group));
     await sink.write("全部文件夹汇总.csv",new Blob([csvText(processedViews)],{type:"text/csv;charset=utf-8"}));
+    await sink.write(`${safeFileName(state.project.name)}_细胞计数结果.xlsx`,await cellCountWorkbookBlob(processedGroups));
     await sink.write("细胞逐对象原始数据.csv",new Blob([cellRawCsv(processedViews)],{type:"text/csv;charset=utf-8"}));
     await sink.write("项目.json",new Blob([JSON.stringify(serializableProject(),null,2)],{type:"application/json"}));
     const groupOutputs=new Map();
@@ -1260,11 +1433,23 @@ async function writeExportContents(sink,processedGroups) {
     }
     await sink.finish();
 }
+function processedGroupNames() {
+  return state.project.groups.filter(group=>groupViews(group).some(view=>TARGETS.some(target=>targetStatus(view.id,target)!=="pending")));
+}
+async function exportWorkbook() {
+  if(!state.project||state.busy)return;
+  const groups=processedGroupNames();
+  if(!groups.length)return toast("还没有可导出的计数结果，请先运行至少一个通道",true);
+  state.busy=true;
+  try{
+    downloadBlob(await cellCountWorkbookBlob(groups),`${safeFileName(state.project.name)}_细胞计数结果.xlsx`);
+    toast("Excel 已下载：包含汇总、说明和每个已处理文件夹的工作表");
+  }catch(error){toast(`Excel 导出失败：${error.message}`,true);}
+  finally{state.busy=false;}
+}
 async function exportResults() {
   if (!state.project || state.busy) return;
-  const processedGroups=state.project.groups.filter(group=>
-    groupViews(group).some(view=>TARGETS.some(target=>targetStatus(view.id,target)!=="pending"))
-  );
+  const processedGroups=processedGroupNames();
   if (!processedGroups.length) return toast("还没有处理完成的文件夹，请先运行至少一个通道",true);
   const rootName=`${safeFileName(state.project.name)}_cell-count-results`;
   let sink,fallbackReason="",directoryRootName="";
@@ -1637,7 +1822,7 @@ $("cancelBtn").onclick=()=>{
   if(state.worker) state.worker.terminate();
   state.worker=null;
 };
-$("exportBtn").onclick=exportResults;$("annotatedBtn").onclick=exportAnnotated;
+$("exportBtn").onclick=exportResults;$("excelBtn").onclick=exportWorkbook;$("annotatedBtn").onclick=exportAnnotated;
 $("overlayCanvas").onclick=handleCanvasClick;
 $("selectModeBtn").onclick=()=>setReviewMode("select");
 $("addModeBtn").onclick=()=>setReviewMode("add");

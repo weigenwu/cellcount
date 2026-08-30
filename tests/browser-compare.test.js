@@ -11,6 +11,36 @@ const png = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
   "base64"
 );
+function storedZipEntries(bytes) {
+  const entries=new Map();let offset=0;
+  while(offset+30<=bytes.length&&bytes.readUInt32LE(offset)===0x04034b50){
+    assert.strictEqual(bytes.readUInt16LE(offset+8),0,"test parser only supports stored ZIP entries");
+    const size=bytes.readUInt32LE(offset+18),nameLength=bytes.readUInt16LE(offset+26),extraLength=bytes.readUInt16LE(offset+28);
+    const nameStart=offset+30,dataStart=nameStart+nameLength+extraLength;
+    entries.set(bytes.subarray(nameStart,nameStart+nameLength).toString("utf8"),bytes.subarray(dataStart,dataStart+size));
+    offset=dataStart+size;
+  }
+  return entries;
+}
+function verifyCellCountWorkbook(bytes) {
+  assert.strictEqual(bytes.readUInt32LE(0),0x04034b50);
+  const entries=storedZipEntries(bytes);
+  for(const name of ["[Content_Types].xml","_rels/.rels","xl/workbook.xml","xl/_rels/workbook.xml.rels","xl/styles.xml"]){
+    assert(entries.has(name),`missing ${name}`);
+  }
+  const workbook=entries.get("xl/workbook.xml").toString("utf8"),styles=entries.get("xl/styles.xml").toString("utf8");
+  for(const name of ["汇总","说明","实验组A","单通道组"])assert(workbook.includes(`name="${name}"`));
+  assert.strictEqual(/patternType="solid"|<fgColor/i.test(styles),false);
+  assert.match(styles,/<fills count="2"><fill><patternFill patternType="none"\/><\/fill><fill><patternFill patternType="gray125"\/><\/fill><\/fills>/);
+  const sheets=[...entries].filter(([name])=>/^xl\/worksheets\/sheet\d+\.xml$/.test(name)).map(([,value])=>value.toString("utf8"));
+  assert(sheets.some(xml=>xml.includes("效应细胞")&&xml.includes("Overlay001")));
+  assert(sheets.some(xml=>/<f>B6-C6<\/f><v>-?\d+(?:\.\d+)?<\/v>/.test(xml)),"missing formula with cached value");
+  const partial=sheets.find(xml=>xml.includes("Image006"));assert(partial);
+  const imageRow=partial.match(/<row r="6"[^>]*>([\s\S]*?)<\/row>/)?.[1]||"";
+  assert(imageRow.includes('r="A6"'));assert(imageRow.includes('r="B6"'));
+  assert.strictEqual(/r="[CDE]6"/.test(imageRow),false);
+  return entries;
+}
 const experiment = fs.mkdtempSync(path.join(os.tmpdir(), "cellscope-compare-"));
 const group = path.join(experiment, "实验组A");
 fs.mkdirSync(group);
@@ -272,6 +302,21 @@ let browser, page;
   assert.strictEqual(await page.evaluate(()=>"cic_learning" in serializableProject()),false);
   assert.strictEqual(await page.evaluate(()=>Object.values(serializableProject().results).every(result=>!("cic" in result))),true);
   assert.strictEqual(await page.evaluate(()=>exportRunStamp(new Date(2026,7,30,1,2,3,4))),"20260830-010203004");
+  assert.deepStrictEqual(await page.evaluate(()=>({
+    names:[...xlsxSheetNames(["a/b","a:b","汇总","History","12345678901234567890123456789012345",`${"a".repeat(30)}'suffix`,`${"😀".repeat(20)}a`]).values()],
+    escaped:xlsxXml("A&B<1> _x000A_"),
+  })),{
+    names:["a_b","a_b_2","汇总_2","History_","1234567890123456789012345678901","a".repeat(30),"😀".repeat(15)],
+    escaped:"A&amp;B&lt;1&gt; _x005F_x000A_",
+  });
+  const xlsxDownload=page.waitForEvent("download");
+  await page.locator("#excelBtn").click();
+  const downloadedXlsx=await xlsxDownload,downloadedXlsxPath=await downloadedXlsx.path();
+  const xlsxBytes=fs.readFileSync(downloadedXlsxPath);verifyCellCountWorkbook(xlsxBytes);
+  assert.match(downloadedXlsx.suggestedFilename(),/_细胞计数结果\.xlsx$/);
+  if(process.env.CELLSCOPE_XLSX_OUTPUT)fs.copyFileSync(downloadedXlsxPath,process.env.CELLSCOPE_XLSX_OUTPUT);
+  await page.waitForFunction(()=>!state.busy);
+  assert.match(await page.locator("#toast").textContent(),/Excel 已下载/);
   const zipDownload=page.waitForEvent("download");
   await page.evaluate(()=>Object.defineProperty(window,"showDirectoryPicker",{
     configurable:true,value:async()=>({
@@ -285,6 +330,8 @@ let browser, page;
   assert.match(downloadedZip.suggestedFilename(),/_cell-count-results\.zip$/);
   assert.strictEqual(zipBytes.readUInt32LE(0),0x04034b50);
   assert(zipBytes.includes(Buffer.from("全部文件夹汇总.csv")));
+  const zipEntries=storedZipEntries(zipBytes),nestedXlsx=[...zipEntries].find(([name])=>name.endsWith("_细胞计数结果.xlsx"));
+  assert(nestedXlsx);verifyCellCountWorkbook(nestedXlsx[1]);
   assert(zipBytes.includes(Buffer.from("标注图清单.csv")));
   assert(zipBytes.includes(Buffer.from("DAPI-效应细胞")));
   assert(zipBytes.includes(Buffer.from("Overlay001__DAPI__ch02__")));
