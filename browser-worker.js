@@ -1,5 +1,5 @@
 /* global UTIF */
-importScripts("https://cdn.jsdelivr.net/npm/utif@3.1.0/UTIF.min.js");
+importScripts("static/vendor/UTIF.min.js");
 
 const COMPONENT = {dapi: 2, nk: 1, tumor: 0};
 
@@ -68,13 +68,21 @@ function boxBlur(input, width, height, radius) {
 
 function otsuThreshold(data) {
   const histogram = new Uint32Array(256);
-  let total = 0, sum = 0;
   for (const value of data) {
-    if (value > 0) { histogram[value]++; total++; sum += value; }
+    if (value > 0) histogram[value]++;
+  }
+  return otsuHistogramThreshold(histogram);
+}
+
+function otsuHistogramThreshold(histogram) {
+  let total = 0, sum = 0;
+  for (let value = 1; value < histogram.length; value++) {
+    total += histogram[value];
+    sum += value * histogram[value];
   }
   if (!total) return 255;
   let backgroundWeight = 0, backgroundSum = 0, bestVariance = -1, best = 0;
-  for (let value = 0; value < 256; value++) {
+  for (let value = 1; value < histogram.length; value++) {
     backgroundWeight += histogram[value];
     if (!backgroundWeight) continue;
     const foregroundWeight = total - backgroundWeight;
@@ -91,7 +99,9 @@ function otsuThreshold(data) {
 function thresholdMask(data, params) {
   const mask = new Uint8Array(data.length);
   if (params.threshold_mode === "auto") {
-    const threshold = otsuThreshold(data);
+    const requestedFactor=Number(params.auto_threshold_factor ?? 1);
+    const factor=Number.isFinite(requestedFactor)?Math.min(1.5,Math.max(0.5,requestedFactor)):1;
+    const threshold = Math.max(0, Math.min(255, Math.round(otsuThreshold(data) * factor)));
     for (let i = 0; i < data.length; i++) mask[i] = data[i] >= threshold ? 1 : 0;
   } else {
     const low = Math.max(0, Number(params.threshold_low));
@@ -268,6 +278,30 @@ function floodLabels(mask, width, height, seeds) {
   return labels;
 }
 
+function convexHullArea(corners, stride) {
+  const points=[...corners].map(key=>({x:key%stride,y:Math.floor(key/stride)}))
+    .sort((left,right)=>left.x-right.x||left.y-right.y);
+  if(points.length<3)return 0;
+  const cross=(origin,left,right)=>(left.x-origin.x)*(right.y-origin.y)-(left.y-origin.y)*(right.x-origin.x);
+  const half=[];
+  for(const point of points){
+    while(half.length>=2&&cross(half[half.length-2],half[half.length-1],point)<=0)half.pop();
+    half.push(point);
+  }
+  const lowerLength=half.length;
+  for(let index=points.length-2;index>0;index--){
+    const point=points[index];
+    while(half.length>lowerLength&&cross(half[half.length-2],half[half.length-1],point)<=0)half.pop();
+    half.push(point);
+  }
+  let twiceArea=0;
+  for(let index=0;index<half.length;index++){
+    const next=half[(index+1)%half.length];
+    twiceArea+=half[index].x*next.y-half[index].y*next.x;
+  }
+  return Math.abs(twiceArea)/2;
+}
+
 function regionDetections(labels, width, height, params) {
   let maxLabel = 0;
   for (const label of labels) if (label > maxLabel) maxLabel = label;
@@ -275,23 +309,34 @@ function regionDetections(labels, width, height, params) {
   const sumX = new Float64Array(maxLabel + 1);
   const sumY = new Float64Array(maxLabel + 1);
   const perimeter = new Uint32Array(maxLabel + 1);
+  const boundaryCorners = new Array(maxLabel + 1);
+  const cornerStride=width+1;
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const i = y * width + x, label = labels[i];
       if (!label) continue;
       area[label]++; sumX[label] += x; sumY[label] += y;
-      if (!x || labels[i - 1] !== label) perimeter[label]++;
-      if (x === width - 1 || labels[i + 1] !== label) perimeter[label]++;
-      if (!y || labels[i - width] !== label) perimeter[label]++;
-      if (y === height - 1 || labels[i + width] !== label) perimeter[label]++;
+      const left=!x||labels[i-1]!==label,right=x===width-1||labels[i+1]!==label;
+      const top=!y||labels[i-width]!==label,bottom=y===height-1||labels[i+width]!==label;
+      if(left)perimeter[label]++;if(right)perimeter[label]++;
+      if(top)perimeter[label]++;if(bottom)perimeter[label]++;
+      if(left||right||top||bottom){
+        const corners=boundaryCorners[label]||(boundaryCorners[label]=new Set());
+        corners.add(y*cornerStride+x);corners.add(y*cornerStride+x+1);
+        corners.add((y+1)*cornerStride+x);corners.add((y+1)*cornerStride+x+1);
+      }
     }
   }
   const detections = [];
   for (let label = 1; label <= maxLabel; label++) {
     if (!area[label]) continue;
     const circularity = Math.min(1, 4 * Math.PI * area[label] / Math.max(1, perimeter[label] ** 2));
+    const hullArea=convexHullArea(boundaryCorners[label]||[],cornerStride);
+    const solidity=Math.min(1,area[label]/Math.max(1,hullArea));
+    const minSolidity=Math.min(1,Math.max(0,Number(params.min_solidity)||0));
     if (area[label] < params.min_area_px || area[label] > params.max_area_px ||
-        circularity < params.min_circularity || circularity > params.max_circularity) continue;
+        circularity < params.min_circularity || circularity > params.max_circularity ||
+        solidity < minSolidity) continue;
     detections.push({
       id: `auto-${detections.length + 1}`,
       _label: label,
@@ -300,6 +345,7 @@ function regionDetections(labels, width, height, params) {
       area_px: area[label],
       radius: Math.sqrt(area[label] / Math.PI),
       circularity,
+      solidity,
       manual: false,
       deleted: false,
     });
@@ -388,7 +434,7 @@ function connectedSignalRuns(mask,width,height,offsetX,offsetY,minBlock) {
   return{runs,pixels:acceptedPixels};
 }
 
-function robustPositivity(signal,width,height,nucleus,nucleusIndex,nuclei,owners,params,pixelSizeUm,scaleBar) {
+function robustPositivity(signal,width,height,nucleus,nucleusIndex,nuclei,owners,params,pixelSizeUm,scaleBar,options={}) {
   const legacyPx=Math.max(0,Number(params.ring_radius_px)||0);
   const ringUm=params.ring_radius_um;
   const ringPx=ringUm!==null&&ringUm!==undefined&&ringUm!==""&&Number.isFinite(Number(ringUm))&&Number(ringUm)>=0
@@ -416,7 +462,19 @@ function robustPositivity(signal,width,height,nucleus,nucleusIndex,nuclei,owners
     .slice(0,Math.max(1,Math.ceil(candidate.length*.25)));
   const baseline=median(fallbackBackground);
   const mad=median(fallbackBackground.map(value=>Math.abs(value-baseline)));
-  const delta=Math.max(Number(params.signal_threshold)||0,(Number(params.signal_mad_multiplier)||0)*1.4826*mad);
+  const residualHistogram=new Uint32Array(256);
+  for(const index of candidate){
+    const residual=Math.max(0,Math.min(255,Math.round(signal[index]-baseline)));
+    if(residual>0)residualHistogram[residual]++;
+  }
+  const userMinimum=Math.max(0,Number(params.signal_threshold)||0);
+  const madThreshold=Math.max(0,(Number(params.signal_mad_multiplier)||0)*1.4826*mad);
+  const autoThreshold=Math.max(0,Number(options.autoThreshold)||0);
+  if(options.histogramOnly)return{
+    residualHistogram,background:baseline,mad,userMinimum,madThreshold,
+    candidatePixels:candidate.length,ringRadiusPx:ringPx,
+  };
+  const delta=Math.max(userMinimum,madThreshold,autoThreshold);
   const signalX0=Math.max(0,Math.floor(nucleus.x-outerRadius)),signalX1=Math.min(width-1,Math.ceil(nucleus.x+outerRadius));
   const signalY0=Math.max(0,Math.floor(nucleus.y-outerRadius)),signalY1=Math.min(height-1,Math.ceil(nucleus.y+outerRadius));
   const localWidth=signalX1-signalX0+1,localHeight=signalY1-signalY0+1;
@@ -430,8 +488,178 @@ function robustPositivity(signal,width,height,nucleus,nucleusIndex,nuclei,owners
   return{
     fraction:candidate.length?accepted.pixels/candidate.length:0,
     background:baseline,mad,threshold:baseline+delta,
+    delta,userMinimum,madThreshold,autoThreshold,
     runs:accepted.runs,areaPx:accepted.pixels,ringRadiusPx:ringPx,
   };
+}
+
+function nucleiMayShareCell(nuclei,pixelSizeUm) {
+  if(nuclei.length<=1)return true;
+  const referenceLimitPx=nuclei.length===2?55:nuclei.length===3?70:0;
+  if(!referenceLimitPx)return false;
+  const limitPx=referenceLimitPx*.218/Math.max(.001,Number(pixelSizeUm)||.218);
+  for(let left=0;left<nuclei.length;left++)for(let right=left+1;right<nuclei.length;right++){
+    if(Math.hypot(nuclei[left].x-nuclei[right].x,nuclei[left].y-nuclei[right].y)>limitPx+1e-9)return false;
+  }
+  return true;
+}
+
+function markerCellInstances(positiveNuclei,width,height,target,params,pixelSizeUm=.218) {
+  if(!positiveNuclei.length)return[];
+  const parent=positiveNuclei.map((_,index)=>index);
+  const find=index=>{
+    while(parent[index]!==index){parent[index]=parent[parent[index]];index=parent[index];}
+    return index;
+  };
+  const join=(left,right)=>{
+    left=find(left);right=find(right);
+    if(left!==right)parent[right]=left;
+  };
+  const rows=new Map();
+  positiveNuclei.forEach((item,index)=>{
+    const runs=item.signal.runs||[];
+    for(let run=0;run<runs.length;run+=3){
+      const y=runs[run],segment={start:runs[run+1],end:runs[run+2],index};
+      if(!rows.has(y))rows.set(y,[]);
+      rows.get(y).push(segment);
+    }
+  });
+  for(const [y,current] of rows){
+    current.sort((left,right)=>left.start-right.start||left.end-right.end);
+    let leader=current[0],reach=leader?.end??-1;
+    for(let index=1;index<current.length;index++){
+      const right=current[index];
+      if(right.start<=reach+1){join(leader.index,right.index);reach=Math.max(reach,right.end);}
+      else{leader=right;reach=right.end;}
+    }
+    const previous=rows.get(y-1);
+    if(!previous)continue;
+    previous.sort((left,right)=>left.start-right.start||left.end-right.end);
+    let first=0;
+    for(const segment of current){
+      while(first<previous.length&&previous[first].end<segment.start-1)first++;
+      for(let index=first;index<previous.length&&previous[index].start<=segment.end+1;index++){
+        join(segment.index,previous[index].index);
+      }
+    }
+  }
+  const grouped=new Map();
+  positiveNuclei.forEach((item,index)=>{
+    const root=find(index);
+    if(!grouped.has(root))grouped.set(root,[]);
+    grouped.get(root).push(item);
+  });
+  const mergeRuns=items=>{
+    const byRow=new Map();
+    for(const item of items){
+      const runs=item.signal.runs||[];
+      for(let run=0;run<runs.length;run+=3){
+        const y=runs[run];
+        if(!byRow.has(y))byRow.set(y,[]);
+        byRow.get(y).push([runs[run+1],runs[run+2]]);
+      }
+    }
+    const merged=[];
+    for(const y of [...byRow.keys()].sort((left,right)=>left-right)){
+      const intervals=byRow.get(y).sort((left,right)=>left[0]-right[0]||left[1]-right[1]);
+      let [start,end]=intervals[0];
+      for(let index=1;index<intervals.length;index++){
+        const [nextStart,nextEnd]=intervals[index];
+        if(nextStart<=end+1)end=Math.max(end,nextEnd);
+        else{merged.push(y,start,end);start=nextStart;end=nextEnd;}
+      }
+      merged.push(y,start,end);
+    }
+    return merged;
+  };
+  const overlapLength=(start,end,intervals)=>{
+    let overlap=0;
+    for(const [otherStart,otherEnd] of intervals||[]){
+      if(otherEnd<start)continue;
+      if(otherStart>end)break;
+      overlap+=Math.max(0,Math.min(end,otherEnd)-Math.max(start,otherStart)+1);
+    }
+    return overlap;
+  };
+  const conservativeGroups=[];
+  for(const sourceItems of grouped.values()){
+    const sourceNuclei=sourceItems.map(item=>item.nucleus),merge=nucleiMayShareCell(sourceNuclei,pixelSizeUm);
+    for(const items of merge?[sourceItems]:sourceItems.map(item=>[item]))conservativeGroups.push({
+      items,sourceNuclei,split:!merge,
+    });
+  }
+  const detections=[];
+  for(const {items,sourceNuclei,split} of conservativeGroups){
+    const runs=mergeRuns(items),byRow=new Map();
+    let area=0,sumX=0,sumY=0,edge=false;
+    for(let run=0;run<runs.length;run+=3){
+      const y=runs[run],start=runs[run+1],end=runs[run+2],length=end-start+1;
+      area+=length;sumX+=(start+end)*length/2;sumY+=y*length;
+      edge=edge||y===0||y===height-1||start===0||end===width-1;
+      if(!byRow.has(y))byRow.set(y,[]);
+      byRow.get(y).push([start,end]);
+    }
+    let perimeter=0;
+    for(const [y,intervals] of byRow)for(const [start,end] of intervals){
+      const length=end-start+1;
+      perimeter+=2+length-overlapLength(start,end,byRow.get(y-1));
+      perimeter+=length-overlapLength(start,end,byRow.get(y+1));
+    }
+    const nuclei=items.map(item=>item.nucleus);
+    const nucleusIds=nuclei.map((nucleus,index)=>nucleus.id??`nucleus-${index+1}`);
+    const nucleusLabels=nuclei.map((nucleus,index)=>nucleus.display_label??index+1);
+    const reviewReasons=[];
+    if(split)reviewReasons.push("crowded");
+    if(nuclei.length>1)reviewReasons.push("multinucleated");
+    if(nuclei.length>=3)reviewReasons.push("three_plus_nuclei");
+    if(edge)reviewReasons.push("edge");
+    if(area>Math.max(1,Number(params.max_area_px)||Infinity))reviewReasons.push("oversized");
+    const fractions=items.map(item=>item.signal.fraction);
+    const id=`${target}-cell-${detections.length+1}`;
+    detections.push({
+      id,cell_id:id,cell_instance_id:id,display_label:detections.length+1,
+      x:area?sumX/area:nuclei.reduce((sum,nucleus)=>sum+nucleus.x,0)/nuclei.length,
+      y:area?sumY/area:nuclei.reduce((sum,nucleus)=>sum+nucleus.y,0)/nuclei.length,
+      radius:Math.sqrt(area/Math.PI),area_px:area,
+      circularity:perimeter?Math.min(1,4*Math.PI*area/(perimeter*perimeter)):0,
+      runs,signal_runs:runs.slice(),manual:false,deleted:false,
+      object_type:"marker_cell_instance",nucleus_ids:nucleusIds,nucleus_labels:nucleusLabels,
+      nucleus_count:nuclei.length,nuclei_per_cell:nuclei.length,edge_touching:edge,
+      source_group_nucleus_count:sourceNuclei.length,
+      source_group_nucleus_ids:sourceNuclei.map((nucleus,index)=>nucleus.id??`nucleus-${index+1}`),
+      anchor_area_px:nuclei.reduce((sum,nucleus)=>sum+(Number(nucleus.area_px)||0),0),
+      anchor_manual:nuclei.some(nucleus=>nucleus.manual),
+      positive_fraction:fractions.reduce((sum,value)=>sum+value,0)/fractions.length,
+      positive_fraction_min:Math.min(...fractions),positive_fraction_max:Math.max(...fractions),
+      signal_background:median(items.map(item=>item.signal.background)),
+      signal_mad:median(items.map(item=>item.signal.mad)),
+      signal_threshold_actual:median(items.map(item=>item.signal.threshold)),
+      resolved_signal_threshold:median(items.map(item=>item.signal.delta)),
+      auto_signal_threshold:median(items.map(item=>item.signal.autoThreshold)),
+      signal_threshold_user_min:median(items.map(item=>item.signal.userMinimum)),
+      signal_threshold_mad:median(items.map(item=>item.signal.madThreshold)),
+      ring_radius_px_resolved:median(items.map(item=>item.signal.ringRadiusPx)),
+      review_required:reviewReasons.length>0,review_reasons:reviewReasons,
+      nucleus_evidence:items.map(item=>({
+        nucleus_id:item.nucleus.id,nucleus_label:item.nucleus.display_label,
+        positive_fraction:item.signal.fraction,signal_area_px:item.signal.areaPx,
+        signal_background:item.signal.background,signal_mad:item.signal.mad,
+        signal_threshold_actual:item.signal.threshold,
+        resolved_signal_threshold:item.signal.delta,
+        auto_signal_threshold:item.signal.autoThreshold,
+        signal_threshold_user_min:item.signal.userMinimum,
+        signal_threshold_mad:item.signal.madThreshold,
+      })),
+    });
+  }
+  detections.sort((left,right)=>left.y-right.y||left.x-right.x);
+  detections.forEach((detection,index)=>{
+    detection.id=`${target}-cell-${index+1}`;
+    detection.cell_id=detection.id;
+    detection.cell_instance_id=detection.id;
+    detection.display_label=index+1;
+  });
+  return detections;
 }
 
 function segmentParticles(data, width, height, params) {
@@ -452,7 +680,7 @@ async function analyze(payload) {
   postProgress(`读取 ${payload.targetLabel} 通道`, 0.04);
   const channel = await decode(payload.channelBuffer, payload.channelExtension, payload.target);
   const {width, height} = channel;
-  let detections;
+  let detections,resolvedSignalThreshold=null;
   if (payload.target !== "dapi" && payload.params.analysis_mode === "nucleus_guided") {
     let nuclei;
     if (Array.isArray(payload.anchorDetections)) {
@@ -469,30 +697,28 @@ async function analyze(payload) {
     const owners=nucleusOwners(nuclei,width,height);
     const pixelSizeUm=Math.max(.001,Number(payload.pixelSizeUm)||1);
     const scaleBar=scaleBarRegion(channel.data,width,height);
+    if(payload.params.signal_threshold_mode==="auto"){
+      postProgress("学习当前视野的背景校正信号阈值", 0.54);
+      const histogram=new Uint32Array(256);
+      for(let index=0;index<nuclei.length;index++){
+        const sample=robustPositivity(channel.data,width,height,nuclei[index],index,nuclei,owners,
+          payload.params,pixelSizeUm,scaleBar,{histogramOnly:true});
+        for(let value=1;value<histogram.length;value++)histogram[value]+=sample.residualHistogram[value];
+      }
+      const otsu=otsuHistogramThreshold(histogram);
+      const otsuForeground=otsu>=255?255:otsu+1;
+      resolvedSignalThreshold=Math.max(Number(payload.params.signal_threshold)||0,otsuForeground);
+    }
     postProgress("计算核周局部中位数与 MAD 信号", 0.68);
-    detections = [];
+    const positiveNuclei=[];
     for (let index=0;index<nuclei.length;index++) {
       const nucleus=nuclei[index];
-      const signal=robustPositivity(channel.data,width,height,nucleus,index,nuclei,owners,payload.params,pixelSizeUm,scaleBar);
+      const signal=robustPositivity(channel.data,width,height,nucleus,index,nuclei,owners,payload.params,pixelSizeUm,scaleBar,
+        resolvedSignalThreshold===null?{}:{autoThreshold:resolvedSignalThreshold});
       if (!signal.areaPx||signal.fraction < payload.params.positive_fraction) continue;
-      const detection={
-        ...nucleus,
-        id:nucleus.id,
-        signal_runs:signal.runs,
-        area_px:signal.areaPx,
-        anchor_area_px:nucleus.area_px,
-        manual:false,
-        deleted:false,
-        anchor_manual:Boolean(nucleus.manual),
-        positive_fraction:signal.fraction,
-        signal_background:signal.background,
-        signal_mad:signal.mad,
-        signal_threshold_actual:signal.threshold,
-        ring_radius_px_resolved:signal.ringRadiusPx,
-      };
-      delete detection.runs;
-      detections.push(detection);
+      positiveNuclei.push({nucleus,signal});
     }
+    detections=markerCellInstances(positiveNuclei,width,height,payload.target,payload.params,pixelSizeUm);
   } else {
     postProgress("平滑、阈值与自适应分水岭", 0.24);
     detections = segmentParticles(channel.data, width, height, payload.params);
@@ -503,7 +729,9 @@ async function analyze(payload) {
     detection.area_um2 = detection.area_px * payload.pixelSizeUm ** 2;
   }
   postProgress("完成颗粒计数", 0.98);
-  return {detections, width, height};
+  const result_kind=payload.target!=="dapi"&&payload.params.analysis_mode==="nucleus_guided"
+    ? "cell_instances_v1":payload.target==="dapi"?"nuclei_v1":"particles_v1";
+  return {detections, width, height, result_kind, resolved_signal_threshold:resolvedSignalThreshold};
 }
 
 onmessage = async event => {

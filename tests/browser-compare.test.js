@@ -5,6 +5,7 @@ const os = require("os");
 const path = require("path");
 const vm = require("vm");
 const { chromium } = require("playwright");
+const learning = require(path.join(__dirname,"..","browser-learning.js"));
 
 const root = path.resolve(__dirname, "..");
 const png = Buffer.from(
@@ -34,12 +35,28 @@ function verifyCellCountWorkbook(bytes) {
   assert.match(styles,/<fills count="2"><fill><patternFill patternType="none"\/><\/fill><fill><patternFill patternType="gray125"\/><\/fill><\/fills>/);
   const sheets=[...entries].filter(([name])=>/^xl\/worksheets\/sheet\d+\.xml$/.test(name)).map(([,value])=>value.toString("utf8"));
   assert(sheets.some(xml=>xml.includes("效应细胞")&&xml.includes("Overlay001")));
-  assert(sheets.some(xml=>/<f>B6-C6<\/f><v>-?\d+(?:\.\d+)?<\/v>/.test(xml)),"missing formula with cached value");
+  assert(sheets.some(xml=>xml.includes("错误/QC")));
+  assert(sheets.some(xml=>/<f>S6-C6<\/f><v>-?\d+(?:\.\d+)?<\/v>/.test(xml)),"missing formula with cached value");
   const partial=sheets.find(xml=>xml.includes("Image006"));assert(partial);
   const imageRow=partial.match(/<row r="6"[^>]*>([\s\S]*?)<\/row>/)?.[1]||"";
   assert(imageRow.includes('r="A6"'));assert(imageRow.includes('r="B6"'));
   assert.strictEqual(/r="[CDE]6"/.test(imageRow),false);
   return entries;
+}
+function verifyLocalLearning() {
+  const key="test:nk";learning.clearProfile(key);
+  for(let index=0;index<4;index++){
+    learning.record(key,{area_px:900+index,circularity:.85,positive_fraction:.7,signal_mad:2,nuclei_per_cell:1},"positive");
+    learning.record(key,{area_px:90+index,circularity:.12,positive_fraction:.04,signal_mad:20,nuclei_per_cell:1},"negative");
+  }
+  assert.strictEqual(learning.stats(key).trained,true);
+  const candidate={classification:"nk",learning_label:"positive",area_px:92,circularity:.12,positive_fraction:.04,signal_mad:20,nuclei_per_cell:1,review_reasons:[]};
+  learning.apply(key,[candidate]);
+  assert.strictEqual(candidate.review_required,true);
+  assert(candidate.review_reasons.includes("learned_mismatch"));
+  const exported=learning.exportData();learning.clearProfile(key);assert.strictEqual(learning.stats(key).total,0);
+  learning.importData(exported,{replace:true});assert.strictEqual(learning.stats(key).trained,true);
+  learning.clearProfile(key);
 }
 const experiment = fs.mkdtempSync(path.join(os.tmpdir(), "cellscope-compare-"));
 const group = path.join(experiment, "实验组A");
@@ -65,6 +82,29 @@ const workerContext={
 vm.createContext(workerContext);
 vm.runInContext(fs.readFileSync(path.join(root,"browser-worker.js"),"utf8"),workerContext);
 
+function verifyParticleCalibrationParameters() {
+  const values=Uint8Array.from([10,10,100,100]);
+  const legacy=workerContext.thresholdMask(values,{threshold_mode:"auto"});
+  const explicitDefaults=workerContext.thresholdMask(values,{threshold_mode:"auto",auto_threshold_factor:1});
+  assert.deepStrictEqual([...legacy],[...explicitDefaults],"missing factor must preserve the old Otsu result");
+  assert.deepStrictEqual(
+    [...workerContext.thresholdMask(values,{threshold_mode:"auto",auto_threshold_factor:1.5})],
+    [0,0,1,1],"raising the factor should reject pixels between the old and adjusted thresholds"
+  );
+
+  const params={min_area_px:1,max_area_px:100,min_circularity:0,max_circularity:1};
+  const square=new Int32Array(25);
+  for(let y=1;y<=2;y++)for(let x=1;x<=2;x++)square[y*5+x]=1;
+  const squareDetection=workerContext.regionDetections(square,5,5,params)[0];
+  assert.strictEqual(squareDetection.solidity,1);
+  const concave=new Int32Array(25);
+  for(const [x,y] of [[0,0],[0,1],[0,2],[1,2],[2,2]])concave[y*5+x]=1;
+  const concaveDetection=workerContext.regionDetections(concave,5,5,params)[0];
+  assert(concaveDetection.solidity<.9&&concaveDetection.solidity>0);
+  assert.strictEqual(workerContext.regionDetections(concave,5,5,{...params,min_solidity:.9}).length,0);
+  assert.strictEqual(workerContext.regionDetections(concave,5,5,{...params,min_solidity:0}).length,1);
+}
+
 async function verifyGuidedSignal() {
   const width=80,height=60,signal=new Uint8Array(width*height).fill(20);
   for(let y=23;y<=26;y++)for(let x=18;x<=21;x++)signal[y*width+x]=110;
@@ -78,12 +118,77 @@ async function verifyGuidedSignal() {
     anchorDetections:nuclei,pixelSizeUm:.5,
     params:{analysis_mode:"nucleus_guided",ring_radius_um:2,ring_radius_px:99,signal_threshold:10,signal_mad_multiplier:3,min_signal_block_um2:1,positive_fraction:.02},
   });
+  assert.strictEqual(result.result_kind,"cell_instances_v1");
   assert.strictEqual(result.detections.length,1);
-  assert.strictEqual(result.detections[0].id,"auto-7");
+  assert.strictEqual(result.detections[0].id,"nk-cell-1");
+  assert.strictEqual(result.detections[0].cell_instance_id,"nk-cell-1");
+  assert.strictEqual(result.detections[0].object_type,"marker_cell_instance");
+  assert.deepStrictEqual([...result.detections[0].nucleus_ids],["auto-7"]);
+  assert.strictEqual(result.detections[0].nuclei_per_cell,1);
   assert.strictEqual(result.detections[0].display_label,1);
   assert.strictEqual(result.detections[0].ring_radius_px_resolved,4);
   assert(result.detections[0].signal_runs.length>0);
   assert(result.detections[0].area_px>=16);
+
+  const continuous=new Uint8Array(width*height).fill(20);
+  for(let y=22;y<=28;y++)for(let x=15;x<=34;x++)continuous[y*width+x]=110;
+  workerContext.decode=async()=>({data:continuous,width,height});
+  const joined=await workerContext.analyze({
+    type:"analyze",target:"tumor",targetLabel:"肿瘤",channelBuffer:new ArrayBuffer(0),channelExtension:".png",
+    anchorDetections:nuclei,pixelSizeUm:.5,
+    params:{analysis_mode:"nucleus_guided",ring_radius_um:2,ring_radius_px:99,signal_threshold:10,signal_mad_multiplier:3,min_signal_block_um2:1,positive_fraction:.02,max_area_px:20000},
+  });
+  assert.strictEqual(joined.result_kind,"cell_instances_v1");
+  assert.strictEqual(joined.detections.length,1,"continuous marker signal should form one cell instance");
+  assert.strictEqual(joined.detections[0].id,"tumor-cell-1");
+  assert.deepStrictEqual([...joined.detections[0].nucleus_ids],["auto-7","auto-8"]);
+  assert.strictEqual(joined.detections[0].nuclei_per_cell,2);
+  assert.strictEqual(joined.detections[0].review_required,true);
+  assert(joined.detections[0].review_reasons.includes("multinucleated"));
+  assert(joined.detections[0].runs.length>0);
+  assert(joined.detections[0].x>20&&joined.detections[0].x<29);
+
+  const separated=new Uint8Array(width*height).fill(20);
+  for(let y=22;y<=28;y++)for(let x=16;x<=22;x++)separated[y*width+x]=110;
+  for(let y=22;y<=28;y++)for(let x=27;x<=33;x++)separated[y*width+x]=110;
+  workerContext.decode=async()=>({data:separated,width,height});
+  const split=await workerContext.analyze({
+    type:"analyze",target:"nk",targetLabel:"NK",channelBuffer:new ArrayBuffer(0),channelExtension:".png",
+    anchorDetections:nuclei,pixelSizeUm:.5,
+    params:{analysis_mode:"nucleus_guided",ring_radius_um:2,ring_radius_px:99,signal_threshold:10,signal_mad_multiplier:3,min_signal_block_um2:1,positive_fraction:.02,max_area_px:20000},
+  });
+  assert.strictEqual(split.detections.length,2,"separated marker signals should remain two cell instances");
+  assert.deepStrictEqual([...split.detections].map(detection=>detection.nuclei_per_cell),[1,1]);
+  assert(split.detections.every(detection=>detection.object_type==="marker_cell_instance"));
+
+  const conservativeInstances=(centres,pixelSizeUm=.218)=>workerContext.markerCellInstances(
+    centres.map((x,index)=>({
+      nucleus:{id:`n${index+1}`,display_label:index+1,x,y:5,radius:4,area_px:50,manual:false},
+      signal:{runs:[5,2,140],fraction:.5,background:20,mad:1,threshold:30,delta:10,
+        autoThreshold:0,userMinimum:10,madThreshold:3,ringRadiusPx:4,areaPx:139},
+    })),150,20,"nk",{max_area_px:20000},pixelSizeUm
+  );
+  const nearPair=conservativeInstances([10,65]);
+  assert.strictEqual(nearPair.length,1,"two nuclei at 55 reference pixels should merge");
+  assert.strictEqual(nearPair[0].nuclei_per_cell,2);
+  assert.strictEqual(nearPair[0].source_group_nucleus_count,2);
+  const farPair=conservativeInstances([10,66]);
+  assert.strictEqual(farPair.length,2,"two nuclei beyond 55 reference pixels should split");
+  assert(farPair.every(item=>item.nuclei_per_cell===1&&item.source_group_nucleus_count===2));
+  assert(farPair.every(item=>item.review_required&&item.review_reasons.includes("crowded")));
+  assert(farPair.every(item=>JSON.stringify(item.runs)===JSON.stringify([5,2,140])));
+  const nearTriple=conservativeInstances([10,40,80]);
+  assert.strictEqual(nearTriple.length,1,"three nuclei within a 70 reference-pixel diameter should merge");
+  assert.strictEqual(nearTriple[0].nuclei_per_cell,3);
+  const farTriple=conservativeInstances([10,45,81]);
+  assert.strictEqual(farTriple.length,3,"a three-nucleus group wider than 70 reference pixels should split");
+  assert(farTriple.every(item=>item.source_group_nucleus_count===3&&item.review_reasons.includes("crowded")));
+  const fourNuclei=conservativeInstances([10,20,30,40]);
+  assert.strictEqual(fourNuclei.length,4,"four connected nuclei should always split for review");
+  assert.strictEqual(new Set(fourNuclei.map(item=>item.cell_instance_id)).size,4);
+  assert(fourNuclei.every(item=>item.source_group_nucleus_count===4&&item.review_reasons.includes("crowded")));
+  assert.strictEqual(conservativeInstances([10,37],.436).length,1,"physical merge distance should scale with pixel size");
+  assert.strictEqual(conservativeInstances([10,38],.436).length,2,"physical split distance should scale with pixel size");
 
   const noise=new Uint8Array(width*height).fill(20);noise[25*width+20]=255;
   const owners=workerContext.nucleusOwners(nuclei,width,height);
@@ -100,6 +205,35 @@ async function verifyGuidedSignal() {
     {ring_radius_um:0,signal_threshold:10,signal_mad_multiplier:3,min_signal_block_um2:1},.5,null);
   assert.strictEqual(denseResult.background,80);
   assert.strictEqual(denseResult.areaPx,0);
+
+  const adaptiveWidth=100,adaptiveHeight=60,adaptiveSignal=new Uint8Array(adaptiveWidth*adaptiveHeight).fill(20);
+  const adaptiveNuclei=[
+    {id:"weak",x:22,y:30,radius:4,area_px:50,circularity:.9,manual:false,deleted:false},
+    {id:"strong",x:72,y:30,radius:4,area_px:50,circularity:.9,manual:false,deleted:false},
+  ];
+  for(let y=0;y<adaptiveHeight;y++)for(let x=0;x<adaptiveWidth;x++){
+    const weakDistance=(x-22)**2+(y-30)**2,strongDistance=(x-72)**2+(y-30)**2;
+    if(weakDistance<=6**2)adaptiveSignal[y*adaptiveWidth+x]=32;
+    if(strongDistance<=5**2)adaptiveSignal[y*adaptiveWidth+x]=100;
+  }
+  workerContext.decode=async()=>({data:adaptiveSignal,width:adaptiveWidth,height:adaptiveHeight});
+  const adaptiveParams={analysis_mode:"nucleus_guided",ring_radius_um:2,signal_threshold:10,
+    signal_mad_multiplier:0,min_signal_block_um2:1,positive_fraction:.02,max_area_px:20000};
+  const manualThreshold=await workerContext.analyze({
+    type:"analyze",target:"nk",targetLabel:"NK",channelBuffer:new ArrayBuffer(0),channelExtension:".png",
+    anchorDetections:adaptiveNuclei,pixelSizeUm:.5,params:adaptiveParams,
+  });
+  assert.strictEqual(manualThreshold.detections.length,2,"legacy/manual threshold should keep both signals");
+  assert.strictEqual(manualThreshold.resolved_signal_threshold,null);
+  const automaticThreshold=await workerContext.analyze({
+    type:"analyze",target:"nk",targetLabel:"NK",channelBuffer:new ArrayBuffer(0),channelExtension:".png",
+    anchorDetections:adaptiveNuclei,pixelSizeUm:.5,params:{...adaptiveParams,signal_threshold_mode:"auto"},
+  });
+  assert.strictEqual(automaticThreshold.detections.length,1,"auto residual threshold should remove diffuse weak signal");
+  assert.deepStrictEqual([...automaticThreshold.detections[0].nucleus_ids],["strong"]);
+  assert(automaticThreshold.resolved_signal_threshold>12);
+  assert.strictEqual(automaticThreshold.detections[0].auto_signal_threshold,automaticThreshold.resolved_signal_threshold);
+  assert.strictEqual(automaticThreshold.detections[0].resolved_signal_threshold,automaticThreshold.resolved_signal_threshold);
 
   const scale=new Uint8Array(100*100),mask=new Uint8Array(100*100).fill(1);
   for(let x=92;x<100;x++)scale[99*100+x]=255;
@@ -121,6 +255,8 @@ const server = http.createServer((request,response)=>{
 let browser, page;
 
 (async()=>{
+  verifyLocalLearning();
+  verifyParticleCalibrationParameters();
   await verifyGuidedSignal();
   await new Promise(resolve=>server.listen(0, "127.0.0.1", resolve));
   const installedBrowser = [
@@ -157,6 +293,146 @@ let browser, page;
   assert(Math.abs(complete.pixel_size_um-0.218)<1e-9);
   assert.match(await page.locator("#channelMappingTitle").textContent(),/Leica XML/);
   assert.match(await page.locator("#channelMappingSummary").getAttribute("title"),/DAPI ch02.*NK ch01.*肿瘤 ch00/);
+  assert.deepStrictEqual(await page.evaluate(()=>{
+    const original={views:state.project.views,groups:state.project.groups,results:state.project.results};
+    const makeView=(group,name)=>({id:`${group}/${name}`,group,name,files:{},fileNames:{},channel_mapping:{},channel_mapping_source:"test"});
+    const makeResult=count=>({
+      status:"done",error:"",result_kind:"nuclei_v1",
+      detections:[...Array.from({length:count},(_,index)=>({id:`n-${index}`,deleted:false})),{id:"deleted",deleted:true}],
+    });
+    const lowGroup="QC低计数组",normalGroup="QC正常组",shortGroup="QC不足组";
+    const lowViews=["低","正常1","正常2","正常3"].map(name=>makeView(lowGroup,name));
+    const normalViews=["正常1","正常2","正常3","正常4"].map(name=>makeView(normalGroup,name));
+    const shortViews=["短1","短2","短3"].map(name=>makeView(shortGroup,name));
+    let output;
+    try{
+      state.project.views=[...original.views,...lowViews,...normalViews,...shortViews];
+      state.project.groups=[...original.groups,lowGroup,normalGroup,shortGroup];
+      state.project.results={...original.results};
+      [40,98,100,102].forEach((count,index)=>state.project.results[lowViews[index].id]={dapi:makeResult(count)});
+      [90,100,100,110].forEach((count,index)=>state.project.results[normalViews[index].id]={dapi:makeResult(count)});
+      [100,40,100].forEach((count,index)=>state.project.results[shortViews[index].id]={dapi:makeResult(count)});
+      const lowOutliers=refreshDapiGroupQc(lowGroup),normalOutliers=refreshDapiGroupQc(normalGroup);
+      refreshDapiGroupQc(shortGroup);renderResults();
+      const lowResult=targetResult(lowViews[0].id,"dapi"),sameGroupNormal=targetResult(lowViews[1].id,"dapi");
+      const shortResult=targetResult(shortViews[1].id,"dapi"),record=xlsxResultRecord(lowViews[0]);
+      const row=[...document.querySelectorAll("#resultsBody tr")].find(item=>item.textContent.includes(`${lowGroup} / 低`));
+      output={
+        lowOutliers:lowOutliers.map(view=>view.name),normalOutliers:normalOutliers.length,
+        lowFlags:lowResult.qc_flags,lowRatio:lowResult.qc_ratio,lowMessage:lowResult.qc_message,
+        sameGroupNormalFlags:sameGroupNormal.qc_flags,
+        shortMarked:["qc_flags","qc_message","qc_ratio"].some(key=>Object.hasOwn(shortResult,key)),
+        statusText:row.lastElementChild.textContent,statusTitle:row.lastElementChild.title,statusClass:row.lastElementChild.className,
+        viewError:lowViews[0].error||"",excelIssue:record.issue,excelIssueText:viewIssueText(lowViews[0]),
+        jsonFlags:serializableProject().results[lowViews[0].id].dapi.qc_flags,
+      };
+    }finally{
+      state.project.views=original.views;state.project.groups=original.groups;state.project.results=original.results;renderResults();
+    }
+    return output;
+  }),{
+    lowOutliers:["低"],normalOutliers:0,lowFlags:["dapi_group_outlier"],lowRatio:.404,
+    lowMessage:"DAPI有效计数 40，比同组中位数 99 低 60%（阈值 30%）",sameGroupNormalFlags:[],shortMarked:false,
+    statusText:"DAPI ✓ · NK — · 肿瘤 — · DAPI异常⚠",statusTitle:"DAPI有效计数 40，比同组中位数 99 低 60%（阈值 30%）",
+    statusClass:"status-partial",viewError:"",excelIssue:true,
+    excelIssueText:"DAPI有效计数 40，比同组中位数 99 低 60%（阈值 30%）",jsonFlags:["dapi_group_outlier"],
+  });
+  assert.match(await page.locator("#learningStatus").textContent(),/正确 0.*误识别 0/);
+  assert.deepStrictEqual(await page.evaluate(()=>{
+    const original=collectParameters();
+    $("autoThresholdFactor").value="1.15";$("minSolidity").value="0.75";
+    const changed=collectParameters();populateParameters(original);
+    return{
+      defaults:[original.auto_threshold_factor,original.min_solidity],
+      changed:[changed.auto_threshold_factor,changed.min_solidity],
+      restored:[$("autoThresholdFactor").value,$("minSolidity").value],
+    };
+  }),{defaults:[1,0],changed:[1.15,.75],restored:["1","0"]});
+  assert.deepStrictEqual(await page.evaluate(()=>{
+    const group=state.project.groups[0],saved=serializableProject();
+    const fingerprint=saved.views.find(view=>view.name==="Overlay001").file_fingerprints.dapi;
+    saved.version=4;saved.results={};
+    for(const target of TARGETS){
+      delete saved.parameters_by_group[group][target].signal_threshold_mode;
+      delete saved.parameters_by_group[group][target].auto_threshold_factor;
+      delete saved.parameters_by_group[group][target].min_solidity;
+    }
+    state.pendingProject=saved;mergePendingProject();
+    return{
+      projectVersion:serializableProject().version,
+      newMode:defaultParams("nk").signal_threshold_mode,
+      migratedMode:state.project.parameters_by_group[group].nk.signal_threshold_mode,
+      newFactor:defaultParams("dapi").auto_threshold_factor,
+      migratedFactor:state.project.parameters_by_group[group].dapi.auto_threshold_factor,
+      newSolidity:defaultParams("dapi").min_solidity,
+      migratedSolidity:state.project.parameters_by_group[group].dapi.min_solidity,
+      fingerprintKeys:Object.keys(fingerprint).sort(),fingerprintName:fingerprint.name,
+    };
+  }),{
+    projectVersion:6,newMode:"auto",migratedMode:"manual",
+    newFactor:1,migratedFactor:1,newSolidity:0,migratedSolidity:0,
+    fingerprintKeys:["lastModified","name","size"],fingerprintName:"Overlay001_ch02.png",
+  });
+  assert.deepStrictEqual(await page.evaluate(()=>{
+    const view=state.project.views.find(item=>item.name==="Overlay002");
+    const makeSaved=()=>{
+      const saved=serializableProject();
+      saved.results={
+        [view.id]:{dapi:{status:"done",error:"",detections:[{id:"saved-dapi",x:1,y:1,manual:true,deleted:false}]}}
+      };
+      return saved;
+    };
+    delete state.project.results[view.id];
+    const legacy=makeSaved();delete legacy.views.find(item=>item.id===view.id).file_fingerprints;
+    state.pendingProject=legacy;mergePendingProject();
+    const legacyRestored=Boolean(state.project.results[view.id]);
+    delete state.project.results[view.id];
+    const changed=makeSaved();changed.views.find(item=>item.id===view.id).file_fingerprints.dapi.size++;
+    state.pendingProject=changed;mergePendingProject();
+    const changedRestored=Boolean(state.project.results[view.id]);
+    delete state.project.results[view.id];
+    return{legacyRestored,changedRestored};
+  }),{legacyRestored:true,changedRestored:false});
+  assert.deepStrictEqual(await page.evaluate(async()=>{
+    const originalDecode=decodeRgba,originalChannel=state.channel,view=viewById(state.currentViewId),pending={};
+    let output;
+    decodeRgba=file=>new Promise(resolve=>{pending[file.name]=resolve;});
+    try{
+      state.channel="dapi";const first=showImage();
+      state.channel="nk";const second=showImage();
+      pending[view.files.nk.name]({rgba:new Uint8ClampedArray([0,255,0,255]),width:1,height:1});
+      await second;
+      pending[view.files.dapi.name]({rgba:new Uint8ClampedArray([0,0,255,255]),width:1,height:1});
+      await first;
+      output={channel:state.channel,rgba:Array.from(state.rawImage.rgba)};
+    }finally{
+      decodeRgba=originalDecode;state.channel=originalChannel;await showImage();
+    }
+    return output;
+  }),{channel:"nk",rgba:[0,255,0,255]});
+  assert.deepStrictEqual(await page.evaluate(()=>({
+    preferred:detectionRuns({runs:[1,2,3],signal_runs:[4,5,6]}),
+    inferred:(()=>{
+      const view=viewById(state.currentViewId),previous=state.project.results[view.id];
+      state.project.results[view.id]={
+        dapi:{status:"done",result_kind:"nuclei_v1",detections:["a","b","c"].map((id,index)=>({id,x:index,y:0,classification:"dapi",deleted:false}))},
+        nk:{status:"done",result_kind:"cell_instances_v1",detections:[{id:"nk-cell-1",classification:"nk",nucleus_ids:["a","b"],review_required:true,deleted:false}]},
+        tumor:{status:"done",result_kind:"cell_instances_v1",detections:[]},
+      };
+      const counts=viewCounts(view.id);
+      state.project.results[view.id]={
+        dapi:{status:"done",result_kind:"nuclei_v1",detections:[["a",0],["b",40],["c",80]].map(([id,x])=>({id,x,y:0,classification:"dapi",deleted:false}))},
+        nk:{status:"done",result_kind:"cell_instances_v1",detections:[{nucleus_ids:["a","b"],deleted:false}]},
+        tumor:{status:"done",result_kind:"cell_instances_v1",detections:[{nucleus_ids:["b","c"],deleted:false}]},
+      };
+      const farChain=inferredDapiCellCount(view.id);
+      state.project.results[view.id].dapi.detections[1].x=35;
+      state.project.results[view.id].dapi.detections[2].x=70;
+      const nearChain=inferredDapiCellCount(view.id);
+      if(previous)state.project.results[view.id]=previous;else delete state.project.results[view.id];
+      return{nuclei:counts.dapi.total,cells:counts.dapi.cells,review:counts.nk.review,farChain,nearChain};
+    })(),
+  })),{preferred:[1,2,3],inferred:{nuclei:3,cells:2,review:1,farChain:3,nearChain:1}});
   const partial=await page.evaluate(()=>{
     const view=state.project.views.find(item=>item.name==="Image006");
     return{mapping:view.channel_mapping,files:view.fileNames,error:view.error,source:view.channel_mapping_source,status:overallStatus(view)};
@@ -203,7 +479,7 @@ let browser, page;
   assert.strictEqual(await page.locator("#compareLeftView option").count(), 3);
   assert.strictEqual(await page.locator("#compareRightView option").count(), 3);
   await page.waitForFunction(()=>document.querySelector("#compareLeftImage").width===1);
-  assert.match(await page.locator("#compareLeftStats").textContent(), /DAPI 0/);
+  assert.match(await page.locator("#compareLeftStats").textContent(), /DAPI核 0/);
   assert.match(await page.locator("#compareRightStats").textContent(), /肿瘤 0/);
   await page.locator("#compareLeftChannel").selectOption("nk");
   assert.strictEqual(await page.locator("#compareLeftChannel").inputValue(), "nk");
@@ -238,6 +514,21 @@ let browser, page;
   await page.locator("#saveChannelNamesBtn").click();
   await page.waitForFunction(()=>document.querySelector("#autosaveStatus").textContent==="已自动保存");
   assert.strictEqual(await page.locator("#viewerLabelNk").textContent(),"效应细胞");
+  assert.deepStrictEqual(await page.evaluate(()=>{
+    const view=viewById(state.currentViewId);
+    state.project.results[view.id]={
+      dapi:{status:"done",error:"",detections:[{id:"review-dapi",x:1,y:1,radius:1,classification:"dapi",review_required:true,manual:false,deleted:false}]},
+      nk:{status:"done",error:"",detections:[{id:"keep-nk"}],parameters:{analysis_mode:"nucleus_guided"}},
+      tumor:{status:"done",error:"",detections:[{id:"keep-tumor"}],parameters:{analysis_mode:"nucleus_guided"}},
+    };
+    state.target="dapi";state.detections=state.project.results[view.id].dapi.detections;state.selectedId="review-dapi";
+    confirmSelectedDetection();
+    return{
+      reviewed:state.detections[0].reviewed,
+      dapi:targetStatus(view.id,"dapi"),nk:targetStatus(view.id,"nk"),tumor:targetStatus(view.id,"tumor"),
+      nkId:targetResult(view.id,"nk").detections[0].id,tumorId:targetResult(view.id,"tumor").detections[0].id,
+    };
+  }),{reviewed:true,dapi:"done",nk:"done",tumor:"done",nkId:"keep-nk",tumorId:"keep-tumor"});
   await page.evaluate(()=>{
     const result={status:"done",error:"",detections:[{id:"test-cell",x:0,y:0,radius:1,classification:"dapi",manual:false,deleted:false}]};
     state.project.results[state.currentViewId]={dapi:result};
@@ -258,7 +549,7 @@ let browser, page;
     state.project.results[state.currentViewId].tumor={status:"done",error:"",detections:[],parameters:{analysis_mode:"nucleus_guided"}};
     updateCounts();renderResults();
   });
-  assert.strictEqual(await page.locator("#resultHeaderDapiMinusNk").textContent(),"DAPI-效应细胞");
+  assert.strictEqual(await page.locator("#resultHeaderDapiMinusNk").textContent(),"DAPI细胞-效应细胞");
   await page.evaluate(()=>{
     state.detections[0].deleted=false;
     syncCorrections();
@@ -290,11 +581,34 @@ let browser, page;
     nk:{status:"done",id:"nk-before"},
     tumor:{status:"done",id:"tumor-before"},
   });
+  assert.deepStrictEqual(await page.evaluate(async()=>{
+    const view=viewById(state.currentViewId);
+    state.target="dapi";
+    state.project.results[view.id]={
+      dapi:{status:"done",error:"",detections:[{id:"manual-dapi",x:2,y:3,radius:2,classification:"dapi",manual:true,deleted:false}]},
+      nk:{status:"done",error:"",detections:[{id:"guided-nk"}],parameters:{analysis_mode:"nucleus_guided"}},
+      tumor:{status:"done",error:"",detections:[{id:"guided-tumor"}],parameters:{analysis_mode:"nucleus_guided"}},
+    };
+    state.detections=state.project.results[view.id].dapi.detections;
+    const originalAnalyzeOne=analyzeOne,originalConfirm=window.confirm;
+    window.confirm=()=>true;analyzeOne=async()=>{throw new Error("synthetic analysis failure");};
+    try{await analyzeScope("current");}
+    finally{analyzeOne=originalAnalyzeOne;window.confirm=originalConfirm;}
+    return{
+      dapi:{status:targetStatus(view.id,"dapi"),id:targetResult(view.id,"dapi").detections[0].id,manual:targetResult(view.id,"dapi").detections[0].manual},
+      nk:targetResult(view.id,"nk").detections[0].id,tumor:targetResult(view.id,"tumor").detections[0].id,
+      error:targetResult(view.id,"dapi").error,viewError:view.error,
+    };
+  }),{
+    dapi:{status:"done",id:"manual-dapi",manual:true},nk:"guided-nk",tumor:"guided-tumor",
+    error:"synthetic analysis failure",viewError:"DAPI：synthetic analysis failure",
+  });
+  assert.match(await page.locator("#toast").textContent(),/1 个视野失败.*保留旧结果/);
   assert.strictEqual(await page.locator(".view-item.active .status-dot").getAttribute("class"),"status-dot done");
   assert.match(await page.locator("#resultsBody tr").filter({hasText:"实验组A / Overlay001"}).locator("td:last-child").textContent(),/DAPI ✓.*效应细胞 ✓.*肿瘤 ✓/);
   await page.evaluate(()=>{
-    state.project.results[state.currentViewId].nk={status:"done",error:"",detections:[]};
-    state.project.results[state.currentViewId].tumor={status:"done",error:"",detections:[]};
+    state.project.results[state.currentViewId].nk={status:"done",error:"",result_kind:"cell_instances_v1",detections:[]};
+    state.project.results[state.currentViewId].tumor={status:"done",error:"",result_kind:"cell_instances_v1",detections:[]};
     const partialView=state.project.views.find(view=>view.name==="Image006");
     state.project.results[partialView.id]={dapi:{status:"done",error:"",detections:[]}};
     refreshViewError(viewById(state.currentViewId));updateCounts();renderResults();
@@ -333,7 +647,9 @@ let browser, page;
   const zipEntries=storedZipEntries(zipBytes),nestedXlsx=[...zipEntries].find(([name])=>name.endsWith("_细胞计数结果.xlsx"));
   assert(nestedXlsx);verifyCellCountWorkbook(nestedXlsx[1]);
   assert(zipBytes.includes(Buffer.from("标注图清单.csv")));
-  assert(zipBytes.includes(Buffer.from("DAPI-效应细胞")));
+  assert(zipBytes.includes(Buffer.from("DAPI细胞-效应细胞")));
+  assert(zipBytes.includes(Buffer.from("所含DAPI核数")));
+  assert(zipBytes.includes(Buffer.from("本地纠正学习.json")));
   assert(zipBytes.includes(Buffer.from("Overlay001__DAPI__ch02__")));
   assert(zipBytes.includes(Buffer.from("Overlay001__效应细胞__ch01__")));
   assert(zipBytes.includes(Buffer.from("Overlay001__肿瘤__ch00__")));
@@ -392,9 +708,15 @@ let browser, page;
         const nk=targetResult(state.currentViewId,"nk").detections.filter(item=>!item.deleted);
         const tumor=targetResult(state.currentViewId,"tumor").detections.filter(item=>!item.deleted);
         const ids=new Set(dapi.map(item=>item.id));
-        return{dapi:dapi.length,nk:nk.length,tumor:tumor.length,allAnchored:[...nk,...tumor].every(item=>ids.has(item.id)&&item.display_label!=null&&item.signal_runs?.length)};
+        const marker=[...nk,...tumor],cellIds=marker.map(item=>item.cell_instance_id);
+        return{
+          dapi:dapi.length,nk:nk.length,tumor:tumor.length,dapiCells:viewCounts(state.currentViewId).dapi.cells,
+          review:marker.filter(item=>item.review_required).length,multinucleated:marker.filter(item=>detectionNucleusCount(item)>1).length,
+          allAnchored:marker.every(item=>item.object_type==="marker_cell_instance"&&item.display_label!=null&&item.runs?.length&&item.nucleus_ids?.every(id=>ids.has(id))),
+          uniqueCellIds:new Set(cellIds).size===cellIds.length,
+        };
       });
-      assert(guidedAudit.dapi>0);assert(guidedAudit.allAnchored);
+      assert(guidedAudit.dapi>0);assert(guidedAudit.allAnchored);assert(guidedAudit.uniqueCellIds);assert(guidedAudit.dapiCells>0);
       console.log("real guided analysis audit",guidedAudit);
     }
     if(process.env.CELLSCOPE_CHANNEL_SCREENSHOT)await realPage.screenshot({path:process.env.CELLSCOPE_CHANNEL_SCREENSHOT,fullPage:true});

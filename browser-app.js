@@ -1,7 +1,8 @@
-/* global UTIF */
-const APP_ASSET_VERSION = "20260831-xlsx1";
+/* global UTIF, CellScopeLearning */
+const APP_ASSET_VERSION = "20260901-dapi-calibration1";
 const DEFAULTS = {
   threshold_mode: "manual", threshold_low: 15, threshold_high: 255,
+  auto_threshold_factor: 1, min_solidity: 0,
   gaussian_sigma: 1, opening_radius: 1, watershed_min_distance: 12,
   min_area_px: 400, max_area_px: 20000, min_circularity: 0.3,
   max_circularity: 1,
@@ -12,6 +13,7 @@ function defaultParams(target) {
   return {
     ...DEFAULTS,
     analysis_mode:target === "dapi" ? "particles" : "nucleus_guided",
+    signal_threshold_mode:"auto",
     signal_threshold:target === "nk" ? 10 : 15,
     positive_fraction:0.05,
     ring_radius_um:2,
@@ -43,6 +45,31 @@ const colors = {dapi:"#4d7cff", tumor:"#ff4a5b", nk:"#41e090"};
 const supported = new Set([".tif", ".tiff", ".png", ".jpg", ".jpeg"]);
 function targetLabel(target) {
   return state.project?.channel_labels?.[target] || DEFAULT_CHANNEL_LABELS[target];
+}
+function learningProfileKey(target=state.target) {
+  return `cell-v1:${target}:${targetLabel(target).trim().toLocaleLowerCase()}`;
+}
+function updateLearningStatus() {
+  if(!$("learningStatus")||typeof CellScopeLearning==="undefined")return;
+  const stats=CellScopeLearning.stats(learningProfileKey());
+  $("learningStatus").textContent=stats.trained
+    ? `${targetLabel(state.target)}：已训练 · 正确 ${stats.positive} · 误识别 ${stats.negative}；新结果会自动标出相似性冲突`
+    : `${targetLabel(state.target)}：正确 ${stats.positive} · 误识别 ${stats.negative}；两类各至少 ${stats.minSamplesPerClass} 个后开始学习`;
+}
+function recordLearningFeedback(item,label) {
+  if(!item||typeof CellScopeLearning==="undefined")return;
+  try{
+    CellScopeLearning.record(learningProfileKey(),item,label,{
+      target:state.target,channel_label:targetLabel(state.target),project:state.project?.name,
+      group:state.currentGroup,view:state.currentViewId,source:item.manual?"manual":"automatic",
+    });
+    updateLearningStatus();
+  }catch(error){console.warn("本地纠正学习记录失败",error);}
+}
+function applyLocalLearning(target,detections) {
+  if(typeof CellScopeLearning==="undefined")return detections;
+  for(const item of detections)item.learning_label="positive";
+  return CellScopeLearning.apply(learningProfileKey(target),detections);
 }
 
 function toast(message, error=false) {
@@ -105,6 +132,23 @@ function channelMappingText(mapping) {
 }
 function channelMappingSignature(mapping) {
   return TARGETS.map(target=>`${target}:${mapping?.[target]||""}`).join("|").toLowerCase();
+}
+function viewFileFingerprints(view) {
+  return Object.fromEntries([...TARGETS,"overlay"].map(channel=>{
+    const file=view.files?.[channel];
+    return[channel,file?{name:file.name,size:file.size,lastModified:file.lastModified}:null];
+  }));
+}
+function sameFileFingerprints(saved,current) {
+  return [...TARGETS,"overlay"].every(channel=>{
+    const left=saved?.[channel],right=current?.[channel];
+    return !left&&!right || Boolean(left&&right&&left.name===right.name&&left.size===right.size&&left.lastModified===right.lastModified);
+  });
+}
+function sameLegacyFileNames(saved,current) {
+  if(!saved||!current)return false;
+  const comparable=[...TARGETS,...(Object.hasOwn(saved,"overlay")?["overlay"]:[])];
+  return comparable.every(channel=>String(saved[channel]||"").toLowerCase()===String(current[channel]||"").toLowerCase());
 }
 
 async function scanFolder(fileList) {
@@ -173,7 +217,7 @@ async function scanFolder(fileList) {
   views.sort((a,b) => a.id.localeCompare(b.id, "zh-CN", {numeric:true}));
   const groups = [...new Set(views.map(view => view.group))];
   state.project = {
-    version:4, browserVersion:true, name:root, pixel_size_um:pixelSizeUm, suffixes,
+    version:6, browserVersion:true, name:root, pixel_size_um:pixelSizeUm, suffixes,
     channel_labels:{...DEFAULT_CHANNEL_LABELS},
     groups, views,
     parameters_by_group:Object.fromEntries(groups.map(group => [
@@ -198,27 +242,34 @@ function mergePendingProject() {
     return;
   }
   state.project.channel_labels = {...DEFAULT_CHANNEL_LABELS, ...(saved.channel_labels || {})};
+  if(saved.learning_data&&typeof CellScopeLearning!=="undefined"){
+    try{CellScopeLearning.importData(saved.learning_data);}catch(error){console.warn("项目中的本地学习配置无法恢复",error);}
+  }
   if (Array.isArray(saved.selected_groups)) {
     state.selectedGroups=new Set(saved.selected_groups.filter(group=>state.project.groups.includes(group)));
   }
+  const restoreParams=(target,params)=>{
+    const restored={...defaultParams(target),...params};
+    if(Number(saved.version)===4&&!Object.hasOwn(params,"signal_threshold_mode"))restored.signal_threshold_mode="manual";
+    if(!Object.hasOwn(params,"ring_radius_um")&&Object.hasOwn(params,"ring_radius_px"))restored.ring_radius_um=null;
+    return restored;
+  };
   for (const group of state.project.groups) {
     const savedGroup = saved.parameters_by_group?.[group];
     if (!savedGroup) continue;
     if (savedGroup.dapi || savedGroup.nk || savedGroup.tumor) {
       for (const target of TARGETS) {
         if (savedGroup[target]) {
-          state.project.parameters_by_group[group][target] = {...defaultParams(target), ...savedGroup[target]};
-          if(!Object.hasOwn(savedGroup[target],"ring_radius_um")&&Object.hasOwn(savedGroup[target],"ring_radius_px"))state.project.parameters_by_group[group][target].ring_radius_um=null;
+          state.project.parameters_by_group[group][target] = restoreParams(target,savedGroup[target]);
         }
       }
     } else {
       for (const target of TARGETS) {
-        state.project.parameters_by_group[group][target] = {...defaultParams(target), ...savedGroup};
-        if(!Object.hasOwn(savedGroup,"ring_radius_um")&&Object.hasOwn(savedGroup,"ring_radius_px"))state.project.parameters_by_group[group][target].ring_radius_um=null;
+        state.project.parameters_by_group[group][target] = restoreParams(target,savedGroup);
       }
     }
   }
-  let channelMismatchCount=0;
+  let channelMismatchCount=0,fileMismatchCount=0,legacyRestoreCount=0;
   for (const view of state.project.views) {
     if (saved.results?.[view.id]) {
       const savedResult = saved.results[view.id];
@@ -228,24 +279,46 @@ function mergePendingProject() {
         channelMismatchCount++;
         continue;
       }
+      const savedFingerprints=savedView?.file_fingerprints;
+      if(!savedFingerprints){
+        if(!sameLegacyFileNames(savedView?.fileNames,view.fileNames)){
+          fileMismatchCount++;
+          continue;
+        }
+        legacyRestoreCount++;
+      }
+      else if(!sameFileFingerprints(savedFingerprints,viewFileFingerprints(view))){
+        fileMismatchCount++;
+        continue;
+      }
     if (savedResult.dapi || savedResult.nk || savedResult.tumor) {
         state.project.results[view.id] = {};
         for (const target of TARGETS) {
           if (!savedResult[target]) continue;
-          state.project.results[view.id][target] = {
+          const restored={
             ...savedResult[target],
             detections:(savedResult[target].detections||[]).map(inflateDetection)
           };
+          if(!restored.result_kind){
+            restored.result_kind=target==="dapi"?"nuclei_v1":
+              restored.parameters?.analysis_mode==="nucleus_guided"?"legacy_nucleus_positive_v4":"particles_v1";
+            if(restored.result_kind==="legacy_nucleus_positive_v4")restored.legacy_algorithm=true;
+          }
+          state.project.results[view.id][target]=restored;
         }
       }
       view.status = overallStatus(view);
     }
   }
+  refreshAllDapiQc();
   state.pendingProject = null;
   updateHistoryButtons();
-  toast(channelMismatchCount
-    ? `检测到 ${channelMismatchCount} 个视野的通道顺序已变化，旧计数未恢复，请重新分析`
-    : "已恢复项目参数和计数结果",channelMismatchCount>0);
+  const mismatchCount=channelMismatchCount+fileMismatchCount;
+  toast(mismatchCount
+    ? `已恢复项目参数；${mismatchCount} 个视野因通道或原图无法安全核对，旧计数未恢复`
+    : legacyRestoreCount
+      ? `已按旧项目的原文件名恢复 ${legacyRestoreCount} 个视野；建议抽查标注后再继续`
+      : "已恢复项目参数和计数结果",mismatchCount>0);
 }
 
 function openWorkspace() {
@@ -255,7 +328,7 @@ function openWorkspace() {
   $("projectName").textContent = state.project.name;
   $("projectMeta").textContent = `${state.project.groups.length} 个实验组 · ${state.project.views.length} 个视野`;
   $("pixelSizeBadge").textContent = `${state.project.pixel_size_um} µm/px`;
-  refreshChannelLabels();renderChannelMappingSummary();renderGroups();renderResults();
+  refreshChannelLabels();renderChannelMappingSummary();renderGroups();renderResults();updateLearningStatus();
   const first = state.project.views.find(view => !view.error) || state.project.views[0];
   if (first) selectView(first.id);
   toast(`已在浏览器中识别 ${state.project.views.length} 个视野`);
@@ -300,6 +373,35 @@ async function navigateCurrentGroup(offset) {
 }
 function targetResult(viewId, target=state.target) { return state.project.results[viewId]?.[target]; }
 function targetStatus(viewId, target) { return targetResult(viewId,target)?.status || "pending"; }
+const DAPI_QC_FLAG="dapi_group_outlier";
+function refreshDapiGroupQc(group) {
+  const views=groupViews(group),completed=[];
+  for(const view of views){
+    const result=targetResult(view.id,"dapi");
+    if(!result)continue;
+    delete result.qc_flags;delete result.qc_message;delete result.qc_ratio;
+    if(result.status==="done")completed.push({view,result,total:countTargetDetections(result.detections).total});
+  }
+  if(completed.length<4)return [];
+  const totals=completed.map(item=>item.total).sort((left,right)=>left-right),middle=Math.floor(totals.length/2);
+  const median=totals.length%2?totals[middle]:(totals[middle-1]+totals[middle])/2;
+  const outliers=[];
+  for(const item of completed){
+    const ratio=median?item.total/median:(item.total===0?1:null),deviation=ratio==null?1:Math.abs(ratio-1),outlier=deviation>.3;
+    item.result.qc_ratio=ratio==null?null:Math.round(ratio*10000)/10000;
+    item.result.qc_flags=outlier?[DAPI_QC_FLAG]:[];
+    item.result.qc_message=outlier
+      ? `DAPI有效计数 ${item.total}，比同组中位数 ${median} ${item.total<median?"低":"高"} ${Math.round(deviation*100)}%（阈值 30%）`
+      : "";
+    if(outlier)outliers.push(item.view);
+  }
+  return outliers;
+}
+function refreshAllDapiQc() { return state.project.groups.flatMap(refreshDapiGroupQc); }
+function dapiQcMessage(view) {
+  const result=targetResult(view.id,"dapi");
+  return result?.qc_flags?.includes(DAPI_QC_FLAG)?result.qc_message||"":"";
+}
 function resultUsesDapiAnchor(view,target,result=targetResult(view.id,target)) {
   const mode=result?.parameters?.analysis_mode
     ??state.project.parameters_by_group[view.group]?.[target]?.analysis_mode;
@@ -314,6 +416,7 @@ function refreshViewError(view) {
   view.error=[...new Set(errors.filter(Boolean))].join("；");
   return view.error;
 }
+function viewIssueText(view) { return [refreshViewError(view),dapiQcMessage(view)].filter(Boolean).join("；"); }
 function invalidateGuidedDependents(view,notify=false) {
   const invalidated=[];
   for(const target of ["nk","tumor"]){
@@ -409,18 +512,22 @@ async function decodeRgba(file) {
 
 async function showImage() {
   const view = viewById(state.currentViewId);
-  const file = view?.files[state.channel] || (state.channel==="overlay"?view?.files.dapi:null);
+  const channel=state.channel,requestToken=Symbol("image");
+  state.imageRequest=requestToken;
+  const file = view?.files[channel] || (channel==="overlay"?view?.files.dapi:null);
   if (!file) {
+    state.rawImage=null;
     $("imageStage").style.display="none";
-    $("viewerEmpty").textContent=`当前视野缺少 ${targetLabel(state.channel)} 通道`;
+    $("viewerEmpty").textContent=`当前视野缺少 ${targetLabel(channel)} 通道`;
     $("viewerEmpty").classList.remove("hidden");
+    $("decodeBusy").classList.add("hidden");
     return;
   }
   $("viewerEmpty").textContent="选择左侧视野以查看图像";
   $("decodeBusy").classList.remove("hidden");
   try {
     const decoded = await decodeRgba(file);
-    if (state.currentViewId !== view.id) return;
+    if (state.imageRequest!==requestToken||state.currentViewId!==view.id||state.channel!==channel) return;
     view.width = decoded.width; view.height = decoded.height;
     const imageCanvas = $("imageCanvas"), overlay = $("overlayCanvas");
     imageCanvas.width = overlay.width = decoded.width;
@@ -430,8 +537,12 @@ async function showImage() {
     $("imageStage").style.display = "block";
     $("viewerEmpty").classList.add("hidden");
     renderInspectionView();
-  } catch (error) { toast(error.message, true); }
-  finally { $("decodeBusy").classList.add("hidden"); }
+  } catch (error) {
+    if(state.imageRequest===requestToken&&state.currentViewId===view.id&&state.channel===channel)toast(error.message,true);
+  }
+  finally {
+    if(state.imageRequest===requestToken)$("decodeBusy").classList.add("hidden");
+  }
 }
 
 function fitStage(width, height) {
@@ -448,7 +559,25 @@ function fitStage(width, height) {
   applyViewportTransform();
 }
 
-function detectionRuns(item) { return item.signal_runs?.length?item.signal_runs:(item.runs||[]); }
+function detectionRuns(item) { return item.runs?.length?item.runs:(item.signal_runs||[]); }
+function detectionNucleusCount(item) {
+  return Number.isFinite(Number(item.nuclei_per_cell)) ? Number(item.nuclei_per_cell) :
+    Number.isFinite(Number(item.nucleus_count)) ? Number(item.nucleus_count) :
+    Array.isArray(item.nucleus_ids) ? item.nucleus_ids.length : 0;
+}
+function reviewReasonsText(item) {
+  const labels={
+    multinucleated:"多核候选",three_plus_nuclei:"3 个及以上细胞核",oversized:"信号团块过大",
+    edge:"触及图像边缘",weak_positive:"临界弱阳性",crowded:"细胞密集或粘连",
+    learned_mismatch:"与本地纠正样本不一致",
+  };
+  return (item.review_reasons||[]).map(reason=>labels[reason]||reason).join("、");
+}
+function detectionDisplayLabel(item,fallback,labelPrefix="") {
+  const base=item.display_label??item.cell_id??item.cell_instance_id??fallback;
+  const nuclei=detectionNucleusCount(item);
+  return `${labelPrefix}${base}${nuclei>1?`·${nuclei}核`:""}${item.review_required?"⚠":""}`;
+}
 function buildDetectionMask(width, height, detections, visibleClasses=null) {
   const mask = document.createElement("canvas");
   mask.width = width; mask.height = height;
@@ -530,6 +659,12 @@ function drawOverlay(target=$("overlayCanvas"), existingMask=null) {
   const mask=existingMask||buildAcceptedMask();
   const outlineColor=state.inspectionMode==="binary"?"#ffe600":colors[state.target];
   context.drawImage(outlineMask(mask,outlineColor,state.inspectionMode==="binary"?3:2),0,0);
+  const reviewItems=state.detections.filter(item=>!item.deleted&&item.review_required&&state.visibleClasses.has(item.classification));
+  if(reviewItems.length){
+    const reviewMask=buildDetectionMask(target.width,target.height,reviewItems);
+    context.drawImage(outlineMask(reviewMask,"#ffb84d",4),0,0);
+    reviewMask.width=1;reviewMask.height=1;
+  }
   let activeIndex=0;
   for (const item of state.detections) {
     if (item.deleted || !state.visibleClasses.has(item.classification)) continue;
@@ -549,7 +684,7 @@ function drawOverlay(target=$("overlayCanvas"), existingMask=null) {
     context.lineWidth=3;
     context.strokeStyle=state.inspectionMode==="binary"?"#111":"rgba(0,0,0,.85)";
     context.fillStyle="#fff";
-    const label=String(item.display_label??activeIndex);
+    const label=detectionDisplayLabel(item,activeIndex);
     context.strokeText(label,item.x,item.y);
     context.fillText(label,item.x,item.y);
   }
@@ -558,10 +693,12 @@ function drawOverlay(target=$("overlayCanvas"), existingMask=null) {
 const fieldMap = {
   analysisMode:"analysis_mode",
   thresholdMode:"threshold_mode", thresholdLow:"threshold_low", thresholdHigh:"threshold_high",
+  autoThresholdFactor:"auto_threshold_factor", minSolidity:"min_solidity",
   minArea:"min_area_px", maxArea:"max_area_px", minCircularity:"min_circularity",
   maxCircularity:"max_circularity", gaussianSigma:"gaussian_sigma",
   watershedDistance:"watershed_min_distance",
   signalThreshold:"signal_threshold", positiveFraction:"positive_fraction",
+  signalThresholdMode:"signal_threshold_mode",
   ringRadiusUm:"ring_radius_um", signalMadMultiplier:"signal_mad_multiplier",
   minSignalBlockUm2:"min_signal_block_um2",
 };
@@ -580,7 +717,7 @@ function populateParameters(params) {
 function collectParameters() {
   const params = {...state.project.parameters_by_group[state.currentGroup][state.target]};
   Object.entries(fieldMap).forEach(([id,key]) => {
-    params[key] = id === "thresholdMode" || id === "analysisMode" ? $(id).value : Number($(id).value);
+    params[key] = ["thresholdMode","analysisMode","signalThresholdMode"].includes(id) ? $(id).value : Number($(id).value);
   });
   return params;
 }
@@ -591,15 +728,18 @@ function updateParameterVisibility() {
   $("targetParameterTitle").textContent=`${targetLabel(state.target)} ${guided ? "核引导阳性参数" : "独立计数参数"}`;
 }
 function saveParameters(all=false) {
-  if (!state.currentGroup) return;
+  if (!state.currentGroup) return false;
   const params = collectParameters();
-  if (params.threshold_low > params.threshold_high) return toast("阈值下限不能大于上限", true);
-  if (params.positive_fraction < 0 || params.positive_fraction > 1) return toast("阳性像素比例必须在 0–1 之间", true);
-  if (params.ring_radius_um < 0 || params.signal_mad_multiplier < 0 || params.min_signal_block_um2 < 0) return toast("核周范围、MAD 倍数和最小信号块不能为负数",true);
+  if (params.threshold_low > params.threshold_high) { toast("阈值下限不能大于上限", true); return false; }
+  if (params.auto_threshold_factor < 0.5 || params.auto_threshold_factor > 1.5) { toast("自动阈值系数必须在 0.5–1.5 之间",true); return false; }
+  if (params.min_solidity < 0 || params.min_solidity > 1) { toast("最小实心度必须在 0–1 之间",true); return false; }
+  if (params.positive_fraction < 0 || params.positive_fraction > 1) { toast("阳性像素比例必须在 0–1 之间", true); return false; }
+  if (params.ring_radius_um < 0 || params.signal_mad_multiplier < 0 || params.min_signal_block_um2 < 0) { toast("核周范围、MAD 倍数和最小信号块不能为负数",true); return false; }
   state.project.parameters_by_group[state.currentGroup][state.target] = params;
   if (all) state.project.groups.forEach(group => state.project.parameters_by_group[group][state.target] = {...params});
   scheduleAutosave();
   toast(all ? `${targetLabel(state.target)} 参数已应用到全部实验组` : `已保存“${state.currentGroup}”的 ${targetLabel(state.target)} 参数`);
+  return true;
 }
 function updateAreaNote() {
   if (!state.project) return;
@@ -658,7 +798,7 @@ function analyzeOne(view, params, target) {
 async function analyzeScope(scope) {
   if (!state.project) return;
   if (state.busy) return toast("已有批处理正在运行，请先等待完成或停止");
-  saveParameters(false);
+  if(!saveParameters(false))return;
   const target = state.target;
   let views = scope === "current" ? [viewById(state.currentViewId)] :
     scope === "group" ? groupViews(state.currentGroup) :
@@ -684,6 +824,7 @@ async function analyzeScope(scope) {
   state.busy = true;
   $("jobPanel").classList.remove("hidden");
   const started = performance.now();
+  let failureCount=0;
   for (let index=0; index<views.length; index++) {
     if (state.cancelled) break;
     const view = views[index];
@@ -703,23 +844,30 @@ async function analyzeScope(scope) {
       if (state.cancelled) throw new Error("__cancelled__");
       view.width=result.width; view.height=result.height; view.status="done";
       state.project.results[view.id][target] = {
-        status:"done",error:"",detections:result.detections,
+        status:"done",error:"",detections:applyLocalLearning(target,result.detections),
+        result_kind:result.result_kind,
+        resolved_signal_threshold:result.resolved_signal_threshold,
         parameter_group:view.group,parameters:{...state.project.parameters_by_group[view.group][target]}
       };
+      if(target==="dapi")refreshDapiGroupQc(view.group);
     } catch (error) {
-      if (state.cancelled||error.message==="__cancelled__") {
-        if(previous)state.project.results[view.id][target]=previous;
-        else delete state.project.results[view.id][target];
-        if(previousDependents)for(const [dependent,result] of Object.entries(previousDependents)){
-          if(result)state.project.results[view.id][dependent]=result;
-          else delete state.project.results[view.id][dependent];
-        }
-        refreshViewError(view);view.status=overallStatus(view);
-        renderGroups();renderResults();
-        break;
+      const cancelled=state.cancelled||error.message==="__cancelled__";
+      if(previous){
+        state.project.results[view.id][target]=previous;
+        if(!cancelled)state.project.results[view.id][target].error=error.message;
+      }else if(cancelled){
+        delete state.project.results[view.id][target];
+      }else{
+        state.project.results[view.id][target]={status:"error",error:error.message,detections:[]};
       }
-      state.project.results[view.id][target] = {status:"error",error:error.message,detections:[]};
+      if(previousDependents)for(const [dependent,result] of Object.entries(previousDependents)){
+        if(result)state.project.results[view.id][dependent]=result;
+        else delete state.project.results[view.id][dependent];
+      }
+      if(target==="dapi")refreshDapiGroupQc(view.group);
       refreshViewError(view);view.status=overallStatus(view);
+      if(cancelled){renderGroups();renderResults();break;}
+      failureCount++;
     }
     const elapsed=(performance.now()-started)/1000, remaining=elapsed/(index+1)*(views.length-index-1);
     $("jobCurrent").textContent = `${view.group} / ${view.name} · 剩余约 ${formatSeconds(remaining)}`;
@@ -735,26 +883,84 @@ async function analyzeScope(scope) {
     updateCounts(); renderInspectionView();
   }
   scheduleAutosave();
-  toast(state.cancelled ? `${targetLabel(target)} 批处理已停止，已完成结果仍保留` : `${targetLabel(target)} 分析完成`);
+  const reportDapiQc=target==="dapi"&&!state.cancelled&&scope!=="current";
+  const outlierCount=reportDapiQc
+    ? [...new Set(views.map(view=>view.group))].flatMap(group=>groupViews(group)).filter(view=>dapiQcMessage(view)).length
+    : 0;
+  const completionMessage=(state.cancelled
+    ? `${targetLabel(target)} 批处理已停止，已完成结果仍保留`
+    : failureCount
+      ? `${targetLabel(target)} 分析完成；${failureCount} 个视野失败，已保留旧结果`
+      : `${targetLabel(target)} 分析完成`)+(reportDapiQc?`；DAPI组内QC：${outlierCount} 个异常视野${outlierCount?"⚠":""}`:"");
+  toast(completionMessage,failureCount>0&&!state.cancelled);
 }
 
 function countTargetDetections(detections=[]) {
   const active=detections.filter(item=>!item.deleted);
-  return {total:active.length,corrected:detections.filter(item=>item.manual||item.deleted).length};
+  return {
+    total:active.length,
+    corrected:detections.filter(item=>item.manual||item.deleted).length,
+    review:active.filter(item=>item.review_required).length,
+    multinucleated:active.filter(item=>detectionNucleusCount(item)>1).length,
+  };
+}
+function resultUsesCellInstances(view,target) {
+  const result=targetResult(view.id,target);
+  return result?.status==="done"&&result.result_kind==="cell_instances_v1";
+}
+function nucleiMayShareCell(nuclei,pixelSizeUm) {
+  if(nuclei.length<=1)return true;
+  const referenceLimitPx=nuclei.length===2?55:nuclei.length===3?70:0;
+  if(!referenceLimitPx)return false;
+  const limitPx=referenceLimitPx*.218/Math.max(.001,Number(pixelSizeUm)||.218);
+  for(let left=0;left<nuclei.length;left++)for(let right=left+1;right<nuclei.length;right++){
+    if(Math.hypot(nuclei[left].x-nuclei[right].x,nuclei[left].y-nuclei[right].y)>limitPx+1e-9)return false;
+  }
+  return true;
+}
+function inferredDapiCellCount(viewId) {
+  const view=viewById(viewId),dapi=(targetResult(viewId,"dapi")?.detections||[]).filter(item=>!item.deleted);
+  if(!view||targetStatus(viewId,"dapi")!=="done")return null;
+  const markerTargets=["nk","tumor"].filter(target=>Boolean(view.files[target]));
+  if(!markerTargets.length||markerTargets.some(target=>!resultUsesCellInstances(view,target)))return null;
+  const ids=new Set(dapi.map(item=>item.id)),parent=new Map([...ids].map(id=>[id,id]));
+  const find=id=>{
+    let root=parent.get(id);
+    while(root!==parent.get(root))root=parent.get(root);
+    for(let current=id;current!==root;){const next=parent.get(current);parent.set(current,root);current=next;}
+    return root;
+  };
+  const unite=(first,second)=>{const a=find(first),b=find(second);if(a!==b)parent.set(b,a);};
+  for(const target of markerTargets){
+    for(const item of targetResult(viewId,target).detections||[]){
+      if(item.deleted)continue;
+      const nucleusIds=[...new Set((item.nucleus_ids||[]).filter(id=>ids.has(id)))];
+      for(let index=1;index<nucleusIds.length;index++)unite(nucleusIds[0],nucleusIds[index]);
+    }
+  }
+  const groups=new Map(),byId=new Map(dapi.map(item=>[item.id,item]));
+  for(const id of ids){const root=find(id);if(!groups.has(root))groups.set(root,[]);groups.get(root).push(byId.get(id));}
+  const pixelSizeUm=view.pixel_size_um||state.project.pixel_size_um;
+  return [...groups.values()].reduce((count,nuclei)=>count+(nucleiMayShareCell(nuclei,pixelSizeUm)?1:nuclei.length),0);
 }
 function viewCounts(viewId) {
-  return Object.fromEntries(TARGETS.map(target=>[
+  const counts=Object.fromEntries(TARGETS.map(target=>[
     target,
     countTargetDetections(targetResult(viewId,target)?.detections||[])
   ]));
+  counts.dapi.cells=inferredDapiCellCount(viewId);
+  return counts;
 }
 function updateCounts() {
   const counts=state.currentViewId?viewCounts(state.currentViewId):{};
-  $("countDapi").textContent=targetStatus(state.currentViewId,"dapi")==="done"?counts.dapi.total:"—";
+  $("countDapi").textContent=targetStatus(state.currentViewId,"dapi")==="done"
+    ? `${counts.dapi.total} / ${counts.dapi.cells??"—"}`:"—";
   $("countTumor").textContent=targetStatus(state.currentViewId,"tumor")==="done"?counts.tumor.total:"—";
   $("countNk").textContent=targetStatus(state.currentViewId,"nk")==="done"?counts.nk.total:"—";
+  $("countReview").textContent=counts[state.target]?.review??0;
   $("currentTargetName").textContent=targetLabel(state.target);
   updateActionLabels();
+  updateReviewControls();
 }
 function updateActionLabels() {
   if (!state.project) return;
@@ -770,9 +976,11 @@ function renderResults() {
   $("resultsBody").innerHTML=state.project.views.map(view=>{
     const c=viewCounts(view.id);
     const corrected=c.dapi.corrected+c.nk.corrected+c.tumor.corrected;
-    const dapiMinusNk=targetStatus(view.id,"dapi")==="done"&&targetStatus(view.id,"nk")==="done"?c.dapi.total-c.nk.total:"—";
-    const status=TARGETS.map(target=>`${targetLabel(target)} ${short[targetStatus(view.id,target)]}`).join(" · ");
-    return `<tr><td>${escapeHtml(view.group)} / ${escapeHtml(view.name)}</td><td>${targetStatus(view.id,"dapi")==="done"?c.dapi.total:"—"}</td><td>${targetStatus(view.id,"nk")==="done"?c.nk.total:"—"}</td><td>${targetStatus(view.id,"tumor")==="done"?c.tumor.total:"—"}</td><td>${dapiMinusNk}</td><td>${corrected}</td><td class="status-${overallStatus(view)}" title="${escapeHtml(view.error||"")}">${escapeHtml(status)}</td></tr>`;
+    const pendingReview=c.nk.review+c.tumor.review;
+    const dapiMinusNk=c.dapi.cells!=null&&targetStatus(view.id,"nk")==="done"?c.dapi.cells-c.nk.total:"—";
+    const dapiDisplay=targetStatus(view.id,"dapi")==="done"?`${c.dapi.total} / ${c.dapi.cells??"—"}`:"—";
+    const qc=dapiQcMessage(view),status=TARGETS.map(target=>`${targetLabel(target)} ${short[targetStatus(view.id,target)]}`).join(" · ")+(qc?" · DAPI异常⚠":"");
+    return `<tr><td>${escapeHtml(view.group)} / ${escapeHtml(view.name)}</td><td title="核数 / 基于红绿细胞实例推算的细胞数">${dapiDisplay}</td><td>${targetStatus(view.id,"nk")==="done"?c.nk.total:"—"}</td><td>${targetStatus(view.id,"tumor")==="done"?c.tumor.total:"—"}</td><td>${dapiMinusNk}</td><td>${pendingReview||"—"}</td><td>${corrected}</td><td class="status-${overallStatus(view)}" title="${escapeHtml(viewIssueText(view))}">${escapeHtml(status)}</td></tr>`;
   }).join("");
 }
 
@@ -799,6 +1007,42 @@ function detectionAtPoint(point) {
   });
   return best;
 }
+function updateReviewControls() {
+  const item=state.detections.find(detection=>detection.id===state.selectedId&&!detection.deleted);
+  $("confirmDetectionBtn").disabled=!item||Boolean(item.reviewed&&!item.review_required);
+  $("confirmDetectionBtn").textContent=item?.review_required?"确认保留":"标记正确";
+  if(!item){
+    $("selectionHint").textContent="点击 Cell-ID 查看核数；黄色轮廓需要复核";
+    return;
+  }
+  const nuclei=detectionNucleusCount(item),reason=reviewReasonsText(item);
+  $("selectionHint").textContent=`${item.cell_id||item.cell_instance_id||item.id}${nuclei?` · ${nuclei} 核`:""}${reason?` · ${reason}`:" · 已确认"}`;
+}
+async function nextReviewRequired() {
+  if(!state.project||state.busy)return;
+  const current=viewById(state.currentViewId),views=groupViews(current.group);
+  const start=Math.max(0,views.findIndex(view=>view.id===current.id));
+  for(let offset=0;offset<views.length;offset++){
+    const view=views[(start+offset)%views.length];
+    const candidate=(targetResult(view.id,state.target)?.detections||[]).find(item=>!item.deleted&&item.review_required);
+    if(!candidate)continue;
+    if(view.id!==state.currentViewId)await selectView(view.id);
+    state.detections=targetResult(view.id,state.target)?.detections||[];
+    state.selectedId=candidate.id;updateReviewControls();drawOverlay();
+    return;
+  }
+  toast(`当前文件夹的 ${targetLabel(state.target)} 没有待复核对象`);
+}
+function confirmSelectedDetection() {
+  if(state.busy)return toast("正在分析或导出，请完成后再复核",true);
+  const item=state.detections.find(detection=>detection.id===state.selectedId&&!detection.deleted);
+  if(!item)return toast("请先选择一个 Cell-ID",true);
+  pushHistory("cell");
+  recordLearningFeedback(item,"positive");
+  item.review_required=false;item.reviewed=true;item.manual=true;item.reviewed_at=new Date().toISOString();
+  const id=item.cell_id||item.cell_instance_id||item.id;
+  syncCorrections(false);$("selectionHint").textContent=`已确认保留 ${id}`;
+}
 function handleCanvasClick(event) {
   if(state.busy)return toast("正在分析或导出，请完成后再进行人工修正",true);
   if (state.mode==="pan") return;
@@ -807,39 +1051,53 @@ function handleCanvasClick(event) {
   if (state.mode==="add") {
     pushHistory("cell");
     const pixelSize=viewById(state.currentViewId)?.pixel_size_um||state.project.pixel_size_um;
-    state.detections.push({id:`manual-${Date.now()}`,x:point.x,y:point.y,area_px:452.39,area_um2:452.39*pixelSize**2,radius:12,circularity:1,classification:state.target,manual:true,deleted:false});
-    syncCorrections(); return;
+    const id=`manual-${Date.now()}`;
+    const added={
+      id,cell_instance_id:state.target==="dapi"?null:id,object_type:state.target==="dapi"?"nucleus":"marker_cell_instance",
+      nucleus_ids:[],nucleus_labels:[],nuclei_per_cell:0,review_required:false,review_reasons:[],reviewed:true,
+      x:point.x,y:point.y,area_px:452.39,area_um2:452.39*pixelSize**2,radius:12,circularity:1,
+      classification:state.target,manual:true,deleted:false,
+    };
+    state.detections.push(added);
+    recordLearningFeedback(added,"positive");
+    syncCorrections(true); return;
   }
   const best=detectionAtPoint(point);
   if (state.mode==="delete") {
     if (!best) { $("selectionHint").textContent="未点中细胞标记"; return; }
     pushHistory("cell");
+    recordLearningFeedback(best,"negative");
     best.deleted=true; best.manual=true;
-    syncCorrections();
+    syncCorrections(true);
     $("selectionHint").textContent=`已删除 ${best.id}`;
     return;
   }
   state.selectedId=best?.id||null;
-  $("selectionHint").textContent=best?`已选择 ${best.id}`:"未选中标记";
+  updateReviewControls();
   drawOverlay();
 }
-function syncCorrections() {
+function syncCorrections(dapiGeometryChanged=true) {
   state.project.results[state.currentViewId][state.target].detections=state.detections;
-  if(state.target==="dapi")invalidateGuidedDependents(viewById(state.currentViewId),true);
+  if(state.target==="dapi"){
+    const view=viewById(state.currentViewId);
+    if(dapiGeometryChanged)invalidateGuidedDependents(view,true);
+    refreshDapiGroupQc(view.group);
+  }
   state.selectedId=null; updateCounts(); renderInspectionView(); renderResults();renderGroups();
   scheduleAutosave();
 }
 function reclassify(classification) {
   if(state.busy)return toast("正在分析或导出，请完成后再进行人工修正",true);
   const item=state.detections.find(d=>d.id===state.selectedId); if(!item)return;
-  item.classification=state.target;item.manual=true;syncCorrections();
+  item.classification=state.target;item.manual=true;syncCorrections(false);
 }
 function deleteSelected() {
   if(state.busy)return toast("正在分析或导出，请完成后再进行人工修正",true);
   const item=state.detections.find(d=>d.id===state.selectedId);
   if(!item) return toast("请先选择要删除的细胞标记",true);
   pushHistory("cell");
-  item.deleted=true;item.manual=true;syncCorrections();
+  recordLearningFeedback(item,"negative");
+  item.deleted=true;item.manual=true;syncCorrections(true);
   $("selectionHint").textContent=`已删除 ${item.id}`;
 }
 
@@ -856,12 +1114,16 @@ function serializableProject() {
     }
   }
   return {
-    version:4,browserVersion:true,name:state.project.name,pixel_size_um:state.project.pixel_size_um,
+    version:6,browserVersion:true,name:state.project.name,pixel_size_um:state.project.pixel_size_um,
     suffixes:state.project.suffixes,channel_labels:state.project.channel_labels,
     selected_groups:[...state.selectedGroups],
+    learning_data:typeof CellScopeLearning==="undefined"?null:CellScopeLearning.exportData(),
     groups:state.project.groups,parameters_by_group:state.project.parameters_by_group,
-    views:state.project.views.map(({id,group,name,width,height,status,error,import_error,fileNames,channel_mapping,channel_mapping_source,channel_lut_order,pixel_size_um})=>({
-      id,group,name,width,height,status,error,import_error,fileNames,channel_mapping,channel_mapping_source,channel_lut_order,pixel_size_um
+    views:state.project.views.map(view=>({
+      id:view.id,group:view.group,name:view.name,width:view.width,height:view.height,status:view.status,
+      error:view.error,import_error:view.import_error,fileNames:view.fileNames,file_fingerprints:viewFileFingerprints(view),
+      channel_mapping:view.channel_mapping,channel_mapping_source:view.channel_mapping_source,
+      channel_lut_order:view.channel_lut_order,pixel_size_um:view.pixel_size_um
     })),
     results:serializedResults,updated_at:new Date().toISOString(),
   };
@@ -928,8 +1190,16 @@ async function saveAutosave() {
 function cloneResult(value) {
   return value ? structuredClone(value) : null;
 }
+function dapiGeometrySignature(result) {
+  return JSON.stringify((result?.detections||[]).map(item=>[
+    String(item.id),Boolean(item.deleted),Number(item.x),Number(item.y),Number(item.radius),Number(item.area_px),detectionRuns(item)
+  ]).sort((left,right)=>left[0].localeCompare(right[0])));
+}
 function historySnapshot(kind,viewId=state.currentViewId,target=state.target) {
-  return {kind,viewId,target,value:cloneResult(state.project.results[viewId]?.[target])};
+  return {
+    kind,viewId,target,value:cloneResult(state.project.results[viewId]?.[target]),
+    learning:typeof CellScopeLearning==="undefined"?null:CellScopeLearning.exportData(),
+  };
 }
 function pushHistory(kind,viewId=state.currentViewId,target=state.target) {
   state.undoStack.push(historySnapshot(kind,viewId,target));
@@ -945,13 +1215,16 @@ function updateHistoryButtons() {
 async function restoreHistorySnapshot(snapshot) {
   if(!snapshot||!state.project)return;
   if(!state.project.results[snapshot.viewId])state.project.results[snapshot.viewId]={};
+  const geometryChanged=snapshot.target==="dapi"&&dapiGeometrySignature(state.project.results[snapshot.viewId][snapshot.target])!==dapiGeometrySignature(snapshot.value);
   state.project.results[snapshot.viewId][snapshot.target]=cloneResult(snapshot.value);
-  if(snapshot.target==="dapi")invalidateGuidedDependents(viewById(snapshot.viewId),true);
+  if(snapshot.learning&&typeof CellScopeLearning!=="undefined")CellScopeLearning.importData(snapshot.learning,{replace:true});
+  if(geometryChanged)invalidateGuidedDependents(viewById(snapshot.viewId),true);
+  if(snapshot.target==="dapi")refreshDapiGroupQc(viewById(snapshot.viewId).group);
   if(snapshot.viewId!==state.currentViewId)await selectView(snapshot.viewId);
   if(state.target!==snapshot.target)await setTarget(snapshot.target);
   state.detections=targetResult(snapshot.viewId,snapshot.target)?.detections||[];
   state.selectedId=null;
-  updateCounts();renderResults();renderGroups();renderInspectionView();scheduleAutosave();
+  updateCounts();renderResults();renderGroups();renderInspectionView();updateLearningStatus();scheduleAutosave();
 }
 async function undoCorrection() {
   if(state.busy)return toast("正在分析或导出，请完成后再撤销人工修正",true);
@@ -1174,10 +1447,12 @@ function xlsxResultRecord(view) {
   const values=Object.fromEntries(TARGETS.map(target=>[target,status[target]==="done"?counts[target].total:null]));
   return{
     view,counts,status,...values,
-    dapiMinusNk:values.dapi!=null&&values.nk!=null?values.dapi-values.nk:null,
+    dapiCells:counts.dapi.cells,
+    dapiMinusNk:counts.dapi.cells!=null&&values.nk!=null?counts.dapi.cells-values.nk:null,
+    review:counts.nk.review+counts.tumor.review,
     corrected:counts.dapi.corrected+counts.nk.corrected+counts.tumor.corrected,
     complete:TARGETS.every(target=>status[target]==="done"),
-    issue:Boolean(refreshViewError(view))||TARGETS.some(target=>status[target]!=="done"),
+    issue:Boolean(viewIssueText(view))||TARGETS.some(target=>status[target]!=="done"),
   };
 }
 function xlsxSum(values) { return values.filter(Number.isFinite).reduce((sum,value)=>sum+value,0); }
@@ -1193,11 +1468,11 @@ async function cellCountWorkbookBlob(processedGroups) {
   const summaryRows=[
     xlsxRowXml(1,[{value:`${state.project.name} 细胞计数汇总`,style:1}],28),
     xlsxRowXml(2,[{value:"网页当前计数结果；空白表示相应通道尚未完成，建议结合标注图复核。",style:3}],26),
-    xlsxRowXml(4,["文件夹","视野数","三通道完成",`${labels.dapi} 总数`,`${labels.nk} 总数`,`${labels.tumor} 总数`,`${labels.dapi}-${labels.nk} 总数`,`平均 ${labels.dapi}`,`平均 ${labels.nk}`,`平均 ${labels.tumor}`,"人工修正总数","错误/未完成视野"].map(value=>({value,style:4})),32),
+    xlsxRowXml(4,["文件夹","视野数","三通道完成",`${labels.dapi} 核总数`,`${labels.nk} 细胞总数`,`${labels.tumor} 细胞总数`,`${labels.dapi}细胞-${labels.nk} 总数`,`平均 ${labels.dapi} 核`,`平均 ${labels.nk}`,`平均 ${labels.tumor}`,"人工修正总数","错误/QC/未完成视野",`${labels.dapi} 推算细胞总数`,`平均 ${labels.dapi} 推算细胞`,`${labels.nk} 待复核`,`${labels.tumor} 待复核`,"待复核总数"].map(value=>({value,style:4})),32),
   ];
   processedGroups.forEach((group,index)=>{
     const records=groupRecords.get(group),row=5+index,first=6,last=5+records.length,sheet=xlsxSheetRef(groupSheetNames.get(group));
-    const dapi=records.map(record=>record.dapi),nk=records.map(record=>record.nk),tumor=records.map(record=>record.tumor),difference=records.map(record=>record.dapiMinusNk);
+    const dapi=records.map(record=>record.dapi),nk=records.map(record=>record.nk),tumor=records.map(record=>record.tumor),difference=records.map(record=>record.dapiMinusNk),dapiCells=records.map(record=>record.dapiCells);
     summaryRows.push(xlsxRowXml(row,[
       {value:group,style:11},{value:records.length,style:5},{value:records.filter(record=>record.complete).length,style:5},
       xlsxAggregate(dapi,5,`SUM(${sheet}!B${first}:B${last})`),
@@ -1209,16 +1484,22 @@ async function cellCountWorkbookBlob(processedGroups) {
       xlsxAggregate(tumor,6,`AVERAGE(${sheet}!D${first}:D${last})`,true),
       {value:xlsxSum(records.map(record=>record.corrected)),style:5},
       {value:records.filter(record=>record.issue).length,style:5},
+      xlsxAggregate(dapiCells,5,`SUM(${sheet}!S${first}:S${last})`),
+      xlsxAggregate(dapiCells,6,`AVERAGE(${sheet}!S${first}:S${last})`,true),
+      {value:xlsxSum(records.map(record=>record.counts.nk.review)),style:5,formula:`SUM(${sheet}!T${first}:T${last})`},
+      {value:xlsxSum(records.map(record=>record.counts.tumor.review)),style:5,formula:`SUM(${sheet}!U${first}:U${last})`},
+      {value:xlsxSum(records.map(record=>record.review)),style:5,formula:`SUM(${sheet}!V${first}:V${last})`},
     ]));
   });
-  sheetModels.push({name:"汇总",xml:xlsxWorksheetXml({rows:summaryRows,columnWidths:[18,11,14,14,14,14,18,15,15,15,17,20],dimension:`A1:L${4+processedGroups.length}`,freeze:{x:1,y:4,topLeft:"B5"},merges:["A1:L1","A2:L2"],autoFilter:`A4:L${4+processedGroups.length}`})});
+  sheetModels.push({name:"汇总",xml:xlsxWorksheetXml({rows:summaryRows,columnWidths:[18,11,14,14,14,14,20,15,15,15,17,20,20,20,16,16,16],dimension:`A1:Q${4+processedGroups.length}`,freeze:{x:1,y:4,topLeft:"B5"},merges:["A1:Q1","A2:Q2"],autoFilter:`A4:Q${4+processedGroups.length}`})});
   const processedViews=[...groupRecords.values()].flat(),noteRows=[
     ["项目","内容","状态/参数","使用建议"],
     ["导出范围",`${state.project.name}：${processedGroups.length} 个文件夹，共 ${processedViews.length} 个视野。`,`导出时间 ${exportedAt.toLocaleString("zh-CN")}`,"每个文件夹对应一个独立工作表。"],
     ["通道映射","优先按 Leica XML 的 LUT 名称逐视野识别通道。","不固定假定 ch00/ch01/ch02。","请在汇总和组工作表查看缺失或错误状态。"],
     [labels.dapi,"阈值分割后进行形态学清理、分水岭及面积/圆度过滤。","参数按文件夹独立保存。","正式统计前建议抽查标注轮廓。"],
-    [`${labels.nk}/${labels.tumor}`,`以 ${labels.dapi} 核为锚点，在核周区域评估背景校正信号。`,"红绿参数可分别调整。","人工修正会计入最终数量和修正数。"],
-    [`${labels.dapi}-${labels.nk}`,`按 ${labels.dapi} 总数减 ${labels.nk} 总数计算。`,"仅两个通道均完成时显示。","可与红色通道结果交叉核对。"],
+    [`${labels.nk}/${labels.tumor}`,`以 ${labels.dapi} 核校验局部背景校正信号，再按连续轮廓建立独立 Cell-ID。`,"同一 Cell-ID 可以包含多个核。","黄色多核、过大或触边对象应优先复核。"],
+    [`${labels.dapi} 推算细胞数`,`由红绿 Cell-ID 中共享的多个 ${labels.dapi} 核合并推算。`,"红绿实例均完成后显示。","原始 ${labels.dapi} 核数始终单独保留。"],
+    [`${labels.dapi}细胞-${labels.nk}`,`按 ${labels.dapi} 推算细胞数减 ${labels.nk} 细胞数计算。`,"相关实例分析完成后显示。","可与红色通道结果交叉核对。"],
     ["人工修正","修正数包含人工添加、删除或修改。","原始自动结果和修正保存在项目 JSON。","完整导出同时保留逐对象 CSV 和标注图。"],
     ["缺失/未完成","对应计数在 Excel 中留空，不自动写成 0。","状态和错误列保留原因。","补齐通道或完成分析后重新导出。"],
     ["数据解释","自动计数是可重复的图像定量工具，不等同于生物学验证。","阈值需按实验校准。","低背景、高背景、密集和稀疏视野均应抽查。"],
@@ -1232,25 +1513,27 @@ async function cellCountWorkbookBlob(processedGroups) {
     const rows=[
       xlsxRowXml(1,[{value:`${group} — 逐视野细胞计数`,style:1}],28),
       xlsxRowXml(2,[{value:`视野数：${records.length}　｜　通道按逐视野 XML/后缀映射　｜　导出：${exportedAt.toLocaleString("zh-CN")}`,style:2}],22),
-      xlsxRowXml(3,[{value:`${labels.dapi}-${labels.nk} 为 Excel 公式；空白表示相关通道尚未完成。人工修正数包含添加、删除或修改。`,style:3}],24),
-      xlsxRowXml(5,["视野",labels.dapi,labels.nk,labels.tumor,`${labels.dapi}-${labels.nk}`,`${labels.dapi}修正数`,`${labels.nk}修正数`,`${labels.tumor}修正数`,"修正总数",`${labels.dapi}状态`,`${labels.nk}状态`,`${labels.tumor}状态`,`${labels.dapi}文件`,`${labels.nk}/绿文件`,`${labels.tumor}/红文件`,"通道映射","像素大小 µm/px","错误/QC"].map(value=>({value,style:4})),34),
+      xlsxRowXml(3,[{value:`${labels.dapi}细胞-${labels.nk} 为 Excel 公式；空白表示细胞实例尚未完成。人工修正数包含添加、删除、确认或修改。`,style:3}],24),
+      xlsxRowXml(5,["视野",`${labels.dapi}核数`,`${labels.nk}细胞数`,`${labels.tumor}细胞数`,`${labels.dapi}细胞-${labels.nk}`,`${labels.dapi}修正数`,`${labels.nk}修正数`,`${labels.tumor}修正数`,"修正总数",`${labels.dapi}状态`,`${labels.nk}状态`,`${labels.tumor}状态`,`${labels.dapi}文件`,`${labels.nk}/绿文件`,`${labels.tumor}/红文件`,"通道映射","像素大小 µm/px","错误/QC",`${labels.dapi}推算细胞数`,`${labels.nk}待复核`,`${labels.tumor}待复核`,"待复核总数"].map(value=>({value,style:4})),34),
     ];
     records.forEach((record,index)=>{
       const row=dataStart+index,files=record.view.fileNames||{};
       rows.push(xlsxRowXml(row,[
         {value:record.view.name,style:11},{value:record.dapi,style:5},{value:record.nk,style:5},{value:record.tumor,style:5},
-        record.dapiMinusNk==null?null:{value:record.dapiMinusNk,style:5,formula:`B${row}-C${row}`},
+        record.dapiMinusNk==null?null:{value:record.dapiMinusNk,style:5,formula:`S${row}-C${row}`},
         {value:record.counts.dapi.corrected,style:5},{value:record.counts.nk.corrected,style:5},{value:record.counts.tumor.corrected,style:5},{value:record.corrected,style:5},
         {value:statusText[record.status.dapi],style:10},{value:statusText[record.status.nk],style:10},{value:statusText[record.status.tumor],style:10},
         {value:files.dapi||"",style:10},{value:files.nk||"",style:10},{value:files.tumor||"",style:10},
         {value:`${record.view.channel_mapping_source==="leica_xml"?"Leica XML":"手动后缀"}：${channelMappingText(record.view.channel_mapping)}`,style:10},
-        {value:record.view.pixel_size_um||state.project.pixel_size_um,style:7},{value:refreshViewError(record.view),style:10},
+        {value:record.view.pixel_size_um||state.project.pixel_size_um,style:7},{value:viewIssueText(record.view),style:10},
+        {value:record.dapiCells,style:5},{value:record.counts.nk.review,style:5},{value:record.counts.tumor.review,style:5},{value:record.review,style:5},
       ]));
     });
     const valueColumns=[records.map(record=>record.dapi),records.map(record=>record.nk),records.map(record=>record.tumor),records.map(record=>record.dapiMinusNk),records.map(record=>record.counts.dapi.corrected),records.map(record=>record.counts.nk.corrected),records.map(record=>record.counts.tumor.corrected),records.map(record=>record.corrected)];
-    rows.push(xlsxRowXml(totalRow,[{value:"合计",style:11},...valueColumns.map((values,index)=>xlsxAggregate(values,8,`SUM(${xlsxColumn(index+1)}${dataStart}:${xlsxColumn(index+1)}${dataEnd})`))]));
-    rows.push(xlsxRowXml(meanRow,[{value:"均值",style:11},...valueColumns.map((values,index)=>xlsxAggregate(values,9,`AVERAGE(${xlsxColumn(index+1)}${dataStart}:${xlsxColumn(index+1)}${dataEnd})`,true))]));
-    sheetModels.push({name:groupSheetNames.get(group),xml:xlsxWorksheetXml({rows,columnWidths:[17,11,11,11,16,14,14,14,14,13,13,13,25,25,25,28,17,48],dimension:`A1:R${meanRow}`,freeze:{x:1,y:5,topLeft:"B6"},merges:["A1:R1","A2:R2","A3:R3"],autoFilter:`A5:R${dataEnd}`})});
+    const reviewColumns=[records.map(record=>record.dapiCells),records.map(record=>record.counts.nk.review),records.map(record=>record.counts.tumor.review),records.map(record=>record.review)];
+    rows.push(xlsxRowXml(totalRow,[{value:"合计",style:11},...valueColumns.map((values,index)=>xlsxAggregate(values,8,`SUM(${xlsxColumn(index+1)}${dataStart}:${xlsxColumn(index+1)}${dataEnd})`)),...Array(9).fill(null),...reviewColumns.map((values,index)=>xlsxAggregate(values,8,`SUM(${xlsxColumn(index+18)}${dataStart}:${xlsxColumn(index+18)}${dataEnd})`))]));
+    rows.push(xlsxRowXml(meanRow,[{value:"均值",style:11},...valueColumns.map((values,index)=>xlsxAggregate(values,9,`AVERAGE(${xlsxColumn(index+1)}${dataStart}:${xlsxColumn(index+1)}${dataEnd})`,true)),...Array(9).fill(null),...reviewColumns.map((values,index)=>xlsxAggregate(values,9,`AVERAGE(${xlsxColumn(index+18)}${dataStart}:${xlsxColumn(index+18)}${dataEnd})`,true))]));
+    sheetModels.push({name:groupSheetNames.get(group),xml:xlsxWorksheetXml({rows,columnWidths:[17,13,13,13,20,14,14,14,14,13,13,13,25,25,25,28,17,48,20,16,16,16],dimension:`A1:V${meanRow}`,freeze:{x:1,y:5,topLeft:"B6"},merges:["A1:V1","A2:V2","A3:V3"],autoFilter:`A5:V${dataEnd}`})});
   }
   const archive=new BrowserZipArchive(),sheetOverrides=sheetModels.map((_,index)=>`<Override PartName="/xl/worksheets/sheet${index+1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join("");
   await archive.add("[Content_Types].xml",`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>${sheetOverrides}</Types>`);
@@ -1306,16 +1589,22 @@ async function annotatedBlob(view,target) {
   const detections=(targetResult(view.id,target)?.detections||[]).filter(item=>!item.deleted);
   const mask=buildDetectionMask(decoded.width,decoded.height,detections);
   context.drawImage(outlineMask(mask,colors[target],2),0,0);
+  const reviewDetections=detections.filter(item=>item.review_required);
+  if(reviewDetections.length){
+    const reviewMask=buildDetectionMask(decoded.width,decoded.height,reviewDetections);
+    context.drawImage(outlineMask(reviewMask,"#ffb84d",4),0,0);
+    reviewMask.width=1;reviewMask.height=1;
+  }
   detections.forEach((item,index)=>{
     const fontSize=Math.max(13,Math.min(24,(item.radius||12)*0.8));
     context.font=`700 ${fontSize}px system-ui`;
     context.textAlign="center";context.textBaseline="middle";context.lineWidth=3;
     context.strokeStyle="rgba(0,0,0,.85)";context.fillStyle="#fff";
-    const label=String(item.display_label??index+1);
+    const label=detectionDisplayLabel(item,index+1);
     context.strokeText(label,item.x,item.y);
     context.fillText(label,item.x,item.y);
   });
-  const title=`${view.group} / ${view.name} · ${targetLabel(target)} · n=${detections.length}`;
+  const title=`${view.group} / ${view.name} · ${targetLabel(target)} · n=${detections.length} · 待复核 ${reviewDetections.length}`;
   context.font="700 22px system-ui";context.textAlign="left";context.textBaseline="top";
   const titleWidth=Math.min(decoded.width-24,context.measureText(title).width+28);
   context.fillStyle="rgba(0,0,0,.72)";context.fillRect(12,12,titleWidth,44);
@@ -1327,26 +1616,30 @@ async function annotatedBlob(view,target) {
 function csvText(views=state.project.views) {
   const headers=[
     "实验组","视野",
-    ...TARGETS.map(target=>`${targetLabel(target)}总数`),
-    `${targetLabel("dapi")}-${targetLabel("nk")}`,
+    `${targetLabel("dapi")}核数`,`${targetLabel("dapi")}推算细胞数`,
+    `${targetLabel("nk")}细胞数`,`${targetLabel("tumor")}细胞数`,
+    `${targetLabel("dapi")}细胞-${targetLabel("nk")}`,
+    `${targetLabel("nk")}待复核`,`${targetLabel("tumor")}待复核`,"待复核总数",
     ...TARGETS.map(target=>`${targetLabel(target)}修正数`),
     ...TARGETS.map(target=>`${targetLabel(target)}状态`),
     "DAPI原始文件","NK原始文件","肿瘤原始文件","通道映射来源","像素尺寸_um_per_px",
-    "错误"
+    "错误/QC"
   ];
   const rows=views.map(view=>{
     const c=viewCounts(view.id);
     return [
       view.group,view.name,
       targetStatus(view.id,"dapi")==="done"?c.dapi.total:"",
+      c.dapi.cells??"",
       targetStatus(view.id,"nk")==="done"?c.nk.total:"",
       targetStatus(view.id,"tumor")==="done"?c.tumor.total:"",
-      targetStatus(view.id,"dapi")==="done"&&targetStatus(view.id,"nk")==="done"?c.dapi.total-c.nk.total:"",
+      c.dapi.cells!=null&&targetStatus(view.id,"nk")==="done"?c.dapi.cells-c.nk.total:"",
+      c.nk.review,c.tumor.review,c.nk.review+c.tumor.review,
       c.dapi.corrected,c.nk.corrected,c.tumor.corrected,
       targetStatus(view.id,"dapi"),targetStatus(view.id,"nk"),targetStatus(view.id,"tumor"),
       view.fileNames.dapi,view.fileNames.nk,view.fileNames.tumor,
       view.channel_mapping_source,view.pixel_size_um||state.project.pixel_size_um,
-      refreshViewError(view)
+      viewIssueText(view)
     ];
   });
   const quote=value=>`"${String(value).replaceAll('"','""')}"`;
@@ -1357,19 +1650,26 @@ function csvEncode(rows) {
   return "\ufeff"+rows.map(row=>row.map(quote).join(",")).join("\r\n");
 }
 function cellRawCsv(views=state.project.views) {
-  const rows=[["实验组","视野","通道","对象编号","DAPI核编号","分类","X_px","Y_px","面积_px2","面积_um2","圆度","阳性像素比例","局部背景","背景MAD","实际信号阈值","人工添加或修改","由人工核锚定","已删除"]];
+  const rows=[["实验组","视野","通道","对象编号","Cell-ID","对象类型","所含DAPI核数","DAPI核ID","DAPI核编号","分类","X_px","Y_px","完整轮廓面积_px2","面积_um2","信号面积_px2","圆度","实心度","阳性像素比例","局部背景","背景MAD","实际信号阈值","自动残差阈值","待复核","复核原因","本地学习评分","本地学习置信度","已人工确认","触及边缘","人工添加或修改","由人工核锚定","已删除"]];
   for(const view of views){
     for(const target of TARGETS){
       for(const item of targetResult(view.id,target)?.detections||[]){
         rows.push([
-          view.group,view.name,targetLabel(target),item.id,item.display_label??"",item.classification,
+          view.group,view.name,targetLabel(target),item.id,item.cell_id||item.cell_instance_id||"",item.object_type|| (target==="dapi"?"nucleus":"legacy_detection"),
+          detectionNucleusCount(item),(item.nucleus_ids||[]).join(";"),(item.nucleus_labels||[]).join(";"),item.classification,
           Number(item.x).toFixed(2),Number(item.y).toFixed(2),
           item.area_px??"",item.area_um2==null?"":Number(item.area_um2).toFixed(4),
+          item.signal_area_px??item.signal_runs?.reduce((sum,_,index,runs)=>index%3===0?sum+runs[index+2]-runs[index+1]+1:sum,0)??"",
           item.circularity==null?"":Number(item.circularity).toFixed(4),
+          item.solidity==null?"":Number(item.solidity).toFixed(4),
           item.positive_fraction==null?"":Number(item.positive_fraction).toFixed(4),
           item.signal_background==null?"":Number(item.signal_background).toFixed(4),
           item.signal_mad==null?"":Number(item.signal_mad).toFixed(4),
           item.signal_threshold_actual==null?"":Number(item.signal_threshold_actual).toFixed(4),
+          item.auto_signal_threshold==null?"":Number(item.auto_signal_threshold).toFixed(4),
+          Boolean(item.review_required),(item.review_reasons||[]).join(";"),
+          item.learning_score==null?"":Number(item.learning_score).toFixed(4),item.confidence==null?"":Number(item.confidence).toFixed(4),
+          Boolean(item.reviewed),Boolean(item.edge_touching),
           Boolean(item.manual),Boolean(item.anchor_manual),Boolean(item.deleted)
         ]);
       }
@@ -1383,6 +1683,7 @@ async function writeExportContents(sink,processedGroups) {
     await sink.write(`${safeFileName(state.project.name)}_细胞计数结果.xlsx`,await cellCountWorkbookBlob(processedGroups));
     await sink.write("细胞逐对象原始数据.csv",new Blob([cellRawCsv(processedViews)],{type:"text/csv;charset=utf-8"}));
     await sink.write("项目.json",new Blob([JSON.stringify(serializableProject(),null,2)],{type:"application/json"}));
+    if(typeof CellScopeLearning!=="undefined")await sink.write("本地纠正学习.json",new Blob([JSON.stringify(CellScopeLearning.exportData(),null,2)],{type:"application/json"}));
     const groupOutputs=new Map();
     for (const group of processedGroups) {
       const base=`按原目录排列/${safeRelativePath(group)}`,groupErrors=[];
@@ -1506,6 +1807,19 @@ async function importProject(file) {
     else toast("项目已读取，请重新选择对应的原始图片文件夹");
   } catch(error){toast(`项目文件无效：${error.message}`,true);}
 }
+function exportLearningProfile() {
+  if(typeof CellScopeLearning==="undefined")return toast("本地学习模块未加载",true);
+  const data=JSON.stringify(CellScopeLearning.exportData(),null,2);
+  downloadBlob(new Blob([data],{type:"application/json"}),"CellScope_本地纠正学习.json");
+  toast("学习配置已导出，可在另一台电脑导入继续使用");
+}
+async function importLearningProfile(file) {
+  if(!file||typeof CellScopeLearning==="undefined")return;
+  try{
+    CellScopeLearning.importData(await file.text());updateLearningStatus();scheduleAutosave();
+    toast("学习配置已导入并合并；之后的新分析会使用这些纠正样本");
+  }catch(error){toast(`学习配置导入失败：${error.message}`,true);}
+}
 function applyViewportTransform() {
   $("imageStage").style.transform=`translate(${state.panX}px, ${state.panY}px) scale(${state.zoom})`;
   $("zoomLabel").textContent=`${Math.round(state.zoom*100)}%`;
@@ -1593,16 +1907,18 @@ function refreshChannelLabels() {
     $(`legendLabel${key}`).textContent=label;
     $(`targetLabel${key}`).textContent=label;
     $(`resultHeader${key}`).textContent=label;
-    $(`countLabel${key}`).textContent=`${label} 总数`;
+    $(`countLabel${key}`).textContent=target==="dapi"?`${label} 核数 / 推算细胞`:`${label} 总数`;
     $(`channelName${key}`).value=label;
   }
-  $("resultHeaderDapiMinusNk").textContent=`${targetLabel("dapi")}-${targetLabel("nk")}`;
+  $("resultHeaderDapi").textContent=`${targetLabel("dapi")} 核 / 细胞`;
+  $("resultHeaderDapiMinusNk").textContent=`${targetLabel("dapi")}细胞-${targetLabel("nk")}`;
   $("targetParameterTitle").textContent=`${targetLabel(state.target)} 独立计数参数`;
   $("currentTargetName").textContent=targetLabel(state.target);
   if (state.currentGroup) $("profileGroup").textContent=`${state.currentGroup} · ${targetLabel(state.target)}`;
   $("calibrationWarning").textContent=`推荐顺序：选择 ${targetLabel("dapi")} → 随机预跑 → 保存阈值 → 批量；然后对 ${targetLabel("nk")}、${targetLabel("tumor")} 分别重复。三类参数互不覆盖。`;
   updateActionLabels();
   if (state.currentGroup) updateParameterVisibility();
+  updateLearningStatus();
 }
 function saveChannelNames() {
   if (!state.project) return;
@@ -1634,6 +1950,7 @@ async function setTarget(target) {
     $("profileGroup").textContent=`${state.currentGroup} · ${targetLabel(target)}`;
     populateParameters(state.project.parameters_by_group[state.currentGroup][target]);
   }
+  updateLearningStatus();
   state.detections=state.currentViewId?targetResult(state.currentViewId,target)?.detections||[]:[];
   state.selectedId=null;
   updateCounts();
@@ -1704,19 +2021,25 @@ function drawCompareDetections(canvas,detections,color,labelPrefix="") {
   const mask=buildDetectionMask(canvas.width,canvas.height,active);
   const context=canvas.getContext("2d");
   context.drawImage(outlineMask(mask,color,2),0,0);
+  const review=active.filter(item=>item.review_required);
+  if(review.length){
+    const reviewMask=buildDetectionMask(canvas.width,canvas.height,review);
+    context.drawImage(outlineMask(reviewMask,"#ffb84d",4),0,0);
+    reviewMask.width=1;reviewMask.height=1;
+  }
   if(!state.showLabels)return;
   active.forEach((item,index)=>{
     context.font=`700 ${Math.max(12,Math.min(22,(item.radius||12)*.75))}px system-ui`;
     context.textAlign="center";context.textBaseline="middle";context.lineWidth=3;
     context.strokeStyle="rgba(0,0,0,.88)";context.fillStyle="#fff";
-    const label=`${labelPrefix}${item.display_label??index+1}`;
+    const label=detectionDisplayLabel(item,index+1,labelPrefix);
     context.strokeText(label,item.x,item.y);context.fillText(label,item.x,item.y);
   });
 }
 function updateCompareStats(side,view) {
   const counts=viewCounts(view.id);
   compareNode(side,"Stats").textContent=
-    `${view.group} / ${view.name}　${targetLabel("dapi")} ${counts.dapi.total}　${targetLabel("nk")} ${counts.nk.total}　${targetLabel("tumor")} ${counts.tumor.total}`;
+    `${view.group} / ${view.name}　${targetLabel("dapi")}核 ${counts.dapi.total} / 细胞 ${counts.dapi.cells??"—"}　${targetLabel("nk")} ${counts.nk.total}　${targetLabel("tumor")} ${counts.tumor.total}　待复核 ${counts.nk.review+counts.tumor.review}`;
 }
 async function renderCompareSide(side,resetViewport=true) {
   const pane=compareState[side],view=viewById(pane.viewId);
@@ -1823,12 +2146,16 @@ $("cancelBtn").onclick=()=>{
   state.worker=null;
 };
 $("exportBtn").onclick=exportResults;$("excelBtn").onclick=exportWorkbook;$("annotatedBtn").onclick=exportAnnotated;
+$("exportLearningBtn").onclick=exportLearningProfile;
+$("importLearningInput").onchange=async event=>{await importLearningProfile(event.target.files?.[0]);event.target.value="";};
 $("overlayCanvas").onclick=handleCanvasClick;
 $("selectModeBtn").onclick=()=>setReviewMode("select");
 $("addModeBtn").onclick=()=>setReviewMode("add");
 $("deleteModeBtn").onclick=()=>setReviewMode("delete");
 $("panModeBtn").onclick=()=>setReviewMode("pan");
 $("deleteDetectionBtn").onclick=deleteSelected;
+$("confirmDetectionBtn").onclick=confirmSelectedDetection;
+$("nextReviewBtn").onclick=nextReviewRequired;
 document.querySelectorAll("#channelTabs button").forEach(button=>button.onclick=async()=>{
   if (TARGETS.includes(button.dataset.channel)) {
     await setTarget(button.dataset.channel);

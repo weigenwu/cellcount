@@ -111,7 +111,9 @@ button { color: inherit; }
 .review-mode, .selection-actions { display: flex; align-items: center; gap: 5px; font-size: 10px; }
 .review-mode > span, .selection-actions > span { color: var(--muted); margin-right: 5px; }
 .review-mode button, .selection-actions button { border: 1px solid var(--line); background: #151d28; padding: 6px 8px; border-radius: 6px; font-size: 10px; cursor: pointer; }
+.review-mode button:disabled, .selection-actions button:disabled { opacity: .38; cursor: not-allowed; }
 .review-mode button.active { border-color: var(--blue); color: #a9baff; }
+.selection-actions #confirmDetectionBtn:not(:disabled), .selection-actions #nextReviewBtn { color: #ffd17b; border-color: #6e5425; }
 .selection-actions button.class.red { color: #ff8793; }.selection-actions button.class.green { color: #78eaae; }.selection-actions button.class.amber { color: #ffd17b; }.selection-actions button.class.cyan { color: #7bceff; }
 .selection-actions button.danger { color: #ff7884; }
 .results-panel { padding: 18px; }
@@ -142,11 +144,17 @@ summary::-webkit-details-marker { display: none; }
 .fields small { color: #56657a; }
 .fields input, .fields select { display: block; width: 100%; background: #090d13; border: 1px solid var(--line); color: white; padding: 7px 8px; border-radius: 6px; margin-top: 5px; font-size: 11px; }
 .parameter-note { color: #68788d; font-size: 9px; margin: 8px 0 0; }
+.learning-panel p { color: #68788d; font-size: 9px; line-height: 1.55; }
+.learning-status { border-left: 2px solid var(--amber); padding: 7px 8px; background: #111821; color: #aeb9c8; font-size: 9px; line-height: 1.5; }
+.learning-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin-top: 8px; }
+.learning-actions button, .learning-actions label { border: 1px solid var(--line); background: #151d28; color: #c8d2df; padding: 7px; border-radius: 6px; font-size: 9px; text-align: center; cursor: pointer; }
+.learning-actions input { display: none; }
 .save-profile { width: 100%; margin: 3px 0 14px; }
 .count-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
 .count-cards article { background: #111821; border: 1px solid var(--line); border-left: 2px solid var(--blue); border-radius: 8px; padding: 9px; }
 .count-cards article.tumor { border-left-color: var(--red); }.count-cards article.nk { border-left-color: var(--green); }.count-cards article.review { border-left-color: var(--amber); }
 .count-cards span { display: block; color: var(--muted); font-size: 9px; }
+.count-cards span b { color: #ffd17b; font-weight: 650; }
 .count-cards strong { display: block; font-size: 20px; margin-top: 3px; }
 .batch-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin-top: 13px; }
 .batch-actions .full { grid-column: 1 / -1; }

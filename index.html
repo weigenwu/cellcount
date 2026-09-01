@@ -7,8 +7,8 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; worker-src 'self' blob:; connect-src 'self'">
   <title>CellScope · 浏览器细胞计数</title>
   <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="static/styles.css?v=20260831-xlsx1">
-  <link rel="stylesheet" href="browser.css?v=20260831-xlsx1">
+  <link rel="stylesheet" href="static/styles.css?v=20260901-dapi-calibration1">
+  <link rel="stylesheet" href="browser.css?v=20260901-dapi-calibration1">
 </head>
 <body>
   <header class="topbar">
@@ -131,6 +131,8 @@
         </div>
         <div class="selection-actions">
           <span id="selectionHint">点击标记后可删除；添加会计入当前类别</span>
+          <button id="confirmDetectionBtn" disabled>确认保留</button>
+          <button id="nextReviewBtn">下一个待复核</button>
           <button id="deleteDetectionBtn" class="danger">删除</button>
         </div>
       </div>
@@ -146,7 +148,7 @@
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>实验组 / 视野</th><th id="resultHeaderDapi">DAPI</th><th id="resultHeaderNk">NK</th><th id="resultHeaderTumor">肿瘤</th><th id="resultHeaderDapiMinusNk">DAPI-NK</th><th>修正</th><th>处理进度</th></tr></thead>
+            <thead><tr><th>实验组 / 视野</th><th id="resultHeaderDapi">DAPI 核 / 细胞</th><th id="resultHeaderNk">NK</th><th id="resultHeaderTumor">肿瘤</th><th id="resultHeaderDapiMinusNk">DAPI细胞-NK</th><th>待复核</th><th>修正</th><th>处理进度</th></tr></thead>
             <tbody id="resultsBody"></tbody>
           </table>
         </div>
@@ -173,6 +175,15 @@
         <p>只修改页面和导出结果中的名称，不改变 ch00 / ch01 / ch02 文件配对。</p>
         <button id="saveChannelNamesBtn">保存通道名称</button>
       </details>
+      <details class="learning-panel">
+        <summary>本地纠正学习</summary>
+        <p>“标记正确”和“删除误识别”会成为当前通道的训练样本。样本只保存数值特征，不保存或上传图片。</p>
+        <div id="learningStatus" class="learning-status">当前通道：尚无训练样本</div>
+        <div class="learning-actions">
+          <button id="exportLearningBtn">导出学习配置</button>
+          <label>导入学习配置<input id="importLearningInput" type="file" accept="application/json,.json"></label>
+        </div>
+      </details>
       <div class="profile-scope">
         <span>当前预设</span><strong id="profileGroup">—</strong>
         <button id="applyAllBtn">应用到全部组</button>
@@ -181,17 +192,20 @@
       <details open>
         <summary><span id="targetDot" class="dot blue"></span><span id="targetParameterTitle">DAPI 独立计数参数</span></summary>
         <div class="fields">
-          <label class="full">计数方式<select id="analysisMode"><option value="particles">独立颗粒切割</option><option value="nucleus_guided">按第一通道细胞核判定阳性</option></select></label>
+          <label class="full">计数方式<select id="analysisMode"><option value="particles">独立颗粒切割</option><option value="nucleus_guided">细胞实例（DAPI 核校验，推荐）</option></select></label>
           <label class="full particle-only">阈值模式<select id="thresholdMode"><option value="manual">手动范围</option><option value="auto">Otsu 自动</option></select></label>
           <label class="particle-only">下限<input id="thresholdLow" type="number" min="0" max="255"></label>
           <label class="particle-only">上限<input id="thresholdHigh" type="number" min="0" max="255"></label>
+          <label class="particle-only">自动阈值系数 <small>仅 Otsu</small><input id="autoThresholdFactor" type="number" min="0.5" max="1.5" step="0.05"></label>
+          <label class="particle-only">最小实心度<input id="minSolidity" type="number" min="0" max="1" step="0.01"></label>
           <label class="particle-only">最小面积 <small>px²</small><input id="minArea" type="number" min="1"></label>
           <label class="particle-only">最大面积 <small>px²</small><input id="maxArea" type="number" min="1"></label>
           <label class="particle-only">最小圆度<input id="minCircularity" type="number" min="0" max="1" step="0.01"></label>
           <label class="particle-only">最大圆度<input id="maxCircularity" type="number" min="0" max="1" step="0.01"></label>
           <label class="particle-only">平滑半径<input id="gaussianSigma" type="number" min="0" max="5" step="1"></label>
           <label class="particle-only">分水岭抑制 <small>越大切得越少</small><input id="watershedDistance" type="number" min="1"></label>
-          <label class="guided-only hidden">最小信号差 <small>高于局部背景</small><input id="signalThreshold" type="number" min="0" max="255"></label>
+          <label class="full guided-only hidden">信号阈值<select id="signalThresholdMode"><option value="auto">自动残差阈值（推荐）</option><option value="manual">手动固定阈值</option></select></label>
+          <label class="guided-only hidden">最小信号差 <small>自动模式的下限</small><input id="signalThreshold" type="number" min="0" max="255"></label>
           <label class="guided-only hidden">阳性像素比例<input id="positiveFraction" type="number" min="0" max="1" step="0.01"></label>
           <label class="guided-only hidden">核周范围 <small>µm</small><input id="ringRadiusUm" type="number" min="0" max="30" step="0.1"></label>
           <label class="guided-only hidden">MAD 倍数 <small>抑制高背景</small><input id="signalMadMultiplier" type="number" min="0" max="12" step="0.1"></label>
@@ -199,16 +213,16 @@
         </div>
         <p id="areaConversion" class="parameter-note particle-only">400 px² ≈ 19.0 µm²</p>
         <p class="parameter-note particle-only">核被切碎时调高；粘连核未拆开时调低。建议先在 8–16 之间微调。</p>
-        <p class="parameter-note guided-only hidden">复用第一通道的细胞核，按实际物理距离检查核周信号；背景用局部中位数＋MAD 稳健校正，会排除邻近细胞核并过滤零散噪点。轮廓显示的是真实阳性信号块，编号与 DAPI 核保持一致。</p>
+        <p class="parameter-note guided-only hidden">自动模式会从当前整张图的背景校正残差信号计算阈值，再用局部中位数＋MAD 抑制高背景；随后把连续红/绿信号整理为独立 Cell-ID。多核、过大或触边对象保留计数并以黄色标为待复核。</p>
       </details>
 
       <button class="button sample-button" id="randomSampleBtn">随机抽取当前组一张预跑</button>
       <button class="button save-profile" id="saveProfileBtn">保存当前类别参数</button>
       <div class="count-cards">
-        <article><span id="countLabelDapi">DAPI 总数</span><strong id="countDapi">—</strong></article>
+        <article><span id="countLabelDapi">DAPI 核数 / 推算细胞</span><strong id="countDapi">—</strong></article>
         <article class="nk"><span id="countLabelNk">NK 总数</span><strong id="countNk">—</strong></article>
         <article class="tumor"><span id="countLabelTumor">肿瘤 总数</span><strong id="countTumor">—</strong></article>
-        <article class="review"><span>当前计数对象</span><strong id="currentTargetName">DAPI</strong></article>
+        <article class="review"><span><b id="currentTargetName">DAPI</b> 待复核</span><strong id="countReview">0</strong></article>
       </div>
       <div class="batch-actions">
         <button class="button primary" id="analyzeCurrentBtn">预跑当前图片</button>
@@ -278,7 +292,8 @@
     </div>
     <footer class="compare-help">滚轮缩放 · 左键拖拽 · 双击适应窗口；同步模式按相同图像坐标对齐，适合比较同尺寸视野。</footer>
   </section>
-  <script src="static/vendor/UTIF.min.js"></script>
-  <script src="browser-app.js?v=20260831-xlsx1"></script>
+  <script src="static/vendor/UTIF.min.js?v=20260901-dapi-calibration1"></script>
+  <script src="browser-learning.js?v=20260901-dapi-calibration1"></script>
+  <script src="browser-app.js?v=20260901-dapi-calibration1"></script>
 </body>
 </html>
