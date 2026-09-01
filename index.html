@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; worker-src 'self' blob:; connect-src 'self'">
+  <title>CellScope · 浏览器细胞计数</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="static/styles.css?v=20260901-dapi-calibration1">
+  <link rel="stylesheet" href="browser.css?v=20260901-dapi-calibration1">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+      <div><strong>CellScope</strong><small>浏览器荧光细胞计数</small></div>
+    </div>
+    <div class="privacy-pill"><span></span>浏览器本地计算 · 图片不会上传</div>
+    <div class="top-actions">
+      <label class="button ghost file-button">导入项目<input id="projectInput" type="file" accept=".json"></label>
+      <label class="button primary file-button">选择实验文件夹<input id="folderInput" type="file" webkitdirectory multiple accept=".tif,.tiff,.png,.jpg,.jpeg,.xml"></label>
+    </div>
+  </header>
+
+  <main id="appShell" class="app-shell empty">
+    <section id="welcome" class="welcome">
+      <img class="welcome-micrograph" src="static/assets/cellscope-fluorescence-hero.png" alt="" aria-hidden="true">
+      <div class="welcome-content">
+        <div class="eyebrow">LOCAL FLUORESCENCE ANALYSIS</div>
+        <div class="biology-legend" aria-label="默认荧光通道">
+          <span><i class="blue"></i>DAPI 细胞核</span>
+          <span><i class="green"></i>NK 细胞</span>
+          <span><i class="red"></i>肿瘤细胞</span>
+        </div>
+        <h1>荧光细胞<br><em>批量计数</em></h1>
+        <p>批量识别 · 分通道校准 · 人工修正 · 标注图导出</p>
+        <div class="welcome-actions">
+          <label class="button primary large file-button">选择实验文件夹<input id="welcomeFolderInput" type="file" webkitdirectory multiple accept=".tif,.tiff,.png,.jpg,.jpeg,.xml"></label>
+          <button class="welcome-link" id="mappingToggleBtn">无 XML 时手动映射</button>
+        </div>
+        <div class="local-assurance"><span></span><strong>仅在本机分析</strong>原始图片不上传</div>
+      </div>
+      <div id="mappingPanel" class="mapping-panel hidden">
+        <label><span class="dot blue"></span>DAPI 后缀<input id="suffixDapi" value="_ch00"></label>
+        <label><span class="dot green"></span>NK 后缀<input id="suffixNk" value="_ch01"></label>
+        <label><span class="dot red"></span>肿瘤后缀<input id="suffixTumor" value="_ch02"></label>
+      </div>
+      <div class="capability-rail" aria-label="分析流程">
+        <span><b>01</b><i>批量读取</i><small>实验文件夹</small></span>
+        <span><b>02</b><i>三通道计数</i><small>独立阈值</small></span>
+        <span><b>03</b><i>人工复核</i><small>增删标记</small></span>
+        <span><b>04</b><i>结果导出</i><small>数据与标注图</small></span>
+      </div>
+      <small class="hero-image-note">示意性荧光背景 · 非实验数据</small>
+    </section>
+
+    <aside id="sidebar" class="sidebar hidden">
+      <div class="project-heading">
+        <span class="eyebrow">当前项目</span>
+        <h2 id="projectName">—</h2>
+        <p id="projectMeta">—</p>
+        <div id="channelMappingSummary" class="channel-mapping-summary">
+          <strong id="channelMappingTitle">正在检查通道顺序</strong>
+          <span id="channelMappingDetail">—</span>
+        </div>
+      </div>
+      <div class="sidebar-label">选择要批量处理的文件夹</div>
+      <div class="group-selection-actions">
+        <span id="selectedGroupCount">0 个已选</span>
+        <button id="selectAllGroupsBtn">全选</button>
+        <button id="clearGroupsBtn">清空</button>
+      </div>
+      <div id="groupList" class="group-list"></div>
+    </aside>
+
+    <section id="workspace" class="workspace hidden">
+      <div class="workspace-toolbar">
+        <div>
+          <span class="eyebrow" id="currentGroupLabel">实验组</span>
+          <h2 id="currentViewLabel">请选择视野</h2>
+        </div>
+        <div class="channel-tabs" id="channelTabs">
+          <button data-channel="overlay" class="active">合并</button>
+          <button data-channel="dapi"><span class="dot blue"></span><span id="viewerLabelDapi">DAPI</span></button>
+          <button data-channel="nk"><span class="dot green"></span><span id="viewerLabelNk">NK</span></button>
+          <button data-channel="tumor"><span class="dot red"></span><span id="viewerLabelTumor">肿瘤</span></button>
+        </div>
+        <div class="viewer-actions">
+          <button class="icon-button text compare-button" id="compareBtn" title="并排查看两个视野">双视野比较</button>
+          <div class="inspection-tabs" id="inspectionTabs">
+            <button data-inspection="original" class="active">原图＋真实轮廓</button>
+            <button data-inspection="binary">二值核对图</button>
+          </div>
+          <button class="icon-button" id="zoomOutBtn" title="缩小">−</button>
+          <span id="zoomLabel">100%</span>
+          <button class="icon-button" id="zoomInBtn" title="放大">＋</button>
+          <button class="icon-button text" id="fitBtn">适应</button>
+          <button class="icon-button text" id="centerBtn" title="保留当前倍率并让图片回到视野中心">居中</button>
+          <button class="icon-button text" id="undoBtn" title="撤销上一次人工修正" disabled>撤销</button>
+          <button class="icon-button text" id="redoBtn" title="重做上一次人工修正" disabled>重做</button>
+          <span id="autosaveStatus" class="autosave-status">自动保存待命</span>
+        </div>
+      </div>
+
+      <div id="viewer" class="viewer">
+        <div id="imageStage" class="image-stage">
+          <canvas id="imageCanvas"></canvas>
+          <canvas id="overlayCanvas"></canvas>
+        </div>
+        <button id="previousViewBtn" class="viewer-nav previous" title="当前文件夹上一张（键盘 ←）" aria-label="当前文件夹上一张"><b>‹</b><span>上一张</span></button>
+        <button id="nextViewBtn" class="viewer-nav next" title="当前文件夹下一张（键盘 →）" aria-label="当前文件夹下一张"><span>下一张</span><b>›</b></button>
+        <div id="viewPositionBadge" class="view-position-badge">0 / 0</div>
+        <div id="viewerEmpty" class="viewer-empty">选择左侧视野以查看图像</div>
+        <div id="decodeBusy" class="decode-busy hidden"><i></i><span>正在读取本地图片…</span></div>
+        <div class="legend">
+          <button data-class="dapi" class="active"><span class="blue"></span><span id="legendLabelDapi">DAPI</span></button>
+          <button data-class="nk" class="active"><span class="green"></span><span id="legendLabelNk">NK</span></button>
+          <button data-class="tumor" class="active"><span class="red"></span><span id="legendLabelTumor">肿瘤</span></button>
+          <button id="labelsToggle" class="active">显示编号</button>
+        </div>
+      </div>
+
+      <div id="cellReviewBar" class="review-bar">
+        <div class="review-mode">
+          <span>人工复核</span>
+          <button id="selectModeBtn" class="active">选择标记</button>
+          <button id="addModeBtn">添加细胞</button>
+          <button id="deleteModeBtn" class="delete" title="点击错误识别的轮廓或编号即可删除">删除细胞</button>
+          <button id="panModeBtn" title="也可按住空格再左键拖动，或直接用鼠标中键拖动">拖拽图片</button>
+        </div>
+        <div class="selection-actions">
+          <span id="selectionHint">点击标记后可删除；添加会计入当前类别</span>
+          <button id="confirmDetectionBtn" disabled>确认保留</button>
+          <button id="nextReviewBtn">下一个待复核</button>
+          <button id="deleteDetectionBtn" class="danger">删除</button>
+        </div>
+      </div>
+
+      <div class="results-panel">
+        <div class="panel-heading">
+          <div><span class="eyebrow">RESULTS</span><h3>批量结果</h3></div>
+          <div class="results-actions">
+            <button class="button ghost" id="annotatedBtn">保存当前标注图</button>
+            <button class="button ghost" id="excelBtn">下载 Excel</button>
+            <button class="button primary" id="exportBtn">完整导出（Excel + 标注图）</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>实验组 / 视野</th><th id="resultHeaderDapi">DAPI 核 / 细胞</th><th id="resultHeaderNk">NK</th><th id="resultHeaderTumor">肿瘤</th><th id="resultHeaderDapiMinusNk">DAPI细胞-NK</th><th>待复核</th><th>修正</th><th>处理进度</th></tr></thead>
+            <tbody id="resultsBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <aside id="controlPanel" class="control-panel hidden">
+      <div class="control-head">
+        <div><span class="eyebrow">ANALYSIS PROFILE</span><h2>分析参数</h2></div>
+        <span id="pixelSizeBadge" class="unit-badge">0.218 µm/px</span>
+      </div>
+      <div class="target-picker" id="targetPicker">
+        <button data-target="dapi" class="active"><span class="dot blue"></span><span id="targetLabelDapi">DAPI</span></button>
+        <button data-target="nk"><span class="dot green"></span><span id="targetLabelNk">NK</span></button>
+        <button data-target="tumor"><span class="dot red"></span><span id="targetLabelTumor">肿瘤</span></button>
+      </div>
+      <details class="channel-name-editor">
+        <summary>修改三条通道的显示名称</summary>
+        <div class="channel-name-fields">
+          <label><span class="dot blue"></span><input id="channelNameDapi" value="DAPI" maxlength="30" aria-label="蓝色通道名称"></label>
+          <label><span class="dot green"></span><input id="channelNameNk" value="NK" maxlength="30" aria-label="绿色通道名称"></label>
+          <label><span class="dot red"></span><input id="channelNameTumor" value="肿瘤" maxlength="30" aria-label="红色通道名称"></label>
+        </div>
+        <p>只修改页面和导出结果中的名称，不改变 ch00 / ch01 / ch02 文件配对。</p>
+        <button id="saveChannelNamesBtn">保存通道名称</button>
+      </details>
+      <details class="learning-panel">
+        <summary>本地纠正学习</summary>
+        <p>“标记正确”和“删除误识别”会成为当前通道的训练样本。样本只保存数值特征，不保存或上传图片。</p>
+        <div id="learningStatus" class="learning-status">当前通道：尚无训练样本</div>
+        <div class="learning-actions">
+          <button id="exportLearningBtn">导出学习配置</button>
+          <label>导入学习配置<input id="importLearningInput" type="file" accept="application/json,.json"></label>
+        </div>
+      </details>
+      <div class="profile-scope">
+        <span>当前预设</span><strong id="profileGroup">—</strong>
+        <button id="applyAllBtn">应用到全部组</button>
+      </div>
+
+      <details open>
+        <summary><span id="targetDot" class="dot blue"></span><span id="targetParameterTitle">DAPI 独立计数参数</span></summary>
+        <div class="fields">
+          <label class="full">计数方式<select id="analysisMode"><option value="particles">独立颗粒切割</option><option value="nucleus_guided">细胞实例（DAPI 核校验，推荐）</option></select></label>
+          <label class="full particle-only">阈值模式<select id="thresholdMode"><option value="manual">手动范围</option><option value="auto">Otsu 自动</option></select></label>
+          <label class="particle-only">下限<input id="thresholdLow" type="number" min="0" max="255"></label>
+          <label class="particle-only">上限<input id="thresholdHigh" type="number" min="0" max="255"></label>
+          <label class="particle-only">自动阈值系数 <small>仅 Otsu</small><input id="autoThresholdFactor" type="number" min="0.5" max="1.5" step="0.05"></label>
+          <label class="particle-only">最小实心度<input id="minSolidity" type="number" min="0" max="1" step="0.01"></label>
+          <label class="particle-only">最小面积 <small>px²</small><input id="minArea" type="number" min="1"></label>
+          <label class="particle-only">最大面积 <small>px²</small><input id="maxArea" type="number" min="1"></label>
+          <label class="particle-only">最小圆度<input id="minCircularity" type="number" min="0" max="1" step="0.01"></label>
+          <label class="particle-only">最大圆度<input id="maxCircularity" type="number" min="0" max="1" step="0.01"></label>
+          <label class="particle-only">平滑半径<input id="gaussianSigma" type="number" min="0" max="5" step="1"></label>
+          <label class="particle-only">分水岭抑制 <small>越大切得越少</small><input id="watershedDistance" type="number" min="1"></label>
+          <label class="full guided-only hidden">信号阈值<select id="signalThresholdMode"><option value="auto">自动残差阈值（推荐）</option><option value="manual">手动固定阈值</option></select></label>
+          <label class="guided-only hidden">最小信号差 <small>自动模式的下限</small><input id="signalThreshold" type="number" min="0" max="255"></label>
+          <label class="guided-only hidden">阳性像素比例<input id="positiveFraction" type="number" min="0" max="1" step="0.01"></label>
+          <label class="guided-only hidden">核周范围 <small>µm</small><input id="ringRadiusUm" type="number" min="0" max="30" step="0.1"></label>
+          <label class="guided-only hidden">MAD 倍数 <small>抑制高背景</small><input id="signalMadMultiplier" type="number" min="0" max="12" step="0.1"></label>
+          <label class="guided-only hidden">最小连通信号块 <small>µm²</small><input id="minSignalBlockUm2" type="number" min="0" max="100" step="0.1"></label>
+        </div>
+        <p id="areaConversion" class="parameter-note particle-only">400 px² ≈ 19.0 µm²</p>
+        <p class="parameter-note particle-only">核被切碎时调高；粘连核未拆开时调低。建议先在 8–16 之间微调。</p>
+        <p class="parameter-note guided-only hidden">自动模式会从当前整张图的背景校正残差信号计算阈值，再用局部中位数＋MAD 抑制高背景；随后把连续红/绿信号整理为独立 Cell-ID。多核、过大或触边对象保留计数并以黄色标为待复核。</p>
+      </details>
+
+      <button class="button sample-button" id="randomSampleBtn">随机抽取当前组一张预跑</button>
+      <button class="button save-profile" id="saveProfileBtn">保存当前类别参数</button>
+      <div class="count-cards">
+        <article><span id="countLabelDapi">DAPI 核数 / 推算细胞</span><strong id="countDapi">—</strong></article>
+        <article class="nk"><span id="countLabelNk">NK 总数</span><strong id="countNk">—</strong></article>
+        <article class="tumor"><span id="countLabelTumor">肿瘤 总数</span><strong id="countTumor">—</strong></article>
+        <article class="review"><span><b id="currentTargetName">DAPI</b> 待复核</span><strong id="countReview">0</strong></article>
+      </div>
+      <div class="batch-actions">
+        <button class="button primary" id="analyzeCurrentBtn">预跑当前图片</button>
+        <button class="button ghost" id="analyzeGroupBtn">批量当前组</button>
+        <button class="button ghost full" id="analyzeAllBtn">批量全部视野（当前类别）</button>
+        <button class="button ghost full" id="resumeBtn">继续当前类别未完成视野</button>
+      </div>
+      <div id="jobPanel" class="job-panel hidden">
+        <div><span id="jobTitle">正在分析</span><b id="jobPercent">0%</b></div>
+        <div class="progress"><i id="jobProgress"></i></div>
+        <p id="jobCurrent">准备中…</p>
+        <button id="cancelBtn">停止批处理</button>
+      </div>
+      <p id="calibrationWarning" class="calibration-warning">推荐顺序：选择 DAPI → 随机预跑 → 保存阈值 → 批量；然后对 NK、肿瘤分别重复。三类参数互不覆盖。</p>
+    </aside>
+  </main>
+
+  <div id="toast" class="toast"></div>
+  <section id="compareDialog" class="compare-dialog hidden" aria-label="双视野并排比较">
+    <header class="compare-header">
+      <div>
+        <span class="eyebrow">SIDE-BY-SIDE REVIEW</span>
+        <h2>双视野并排比较</h2>
+      </div>
+      <div class="compare-global-actions">
+        <label><input id="compareSync" type="checkbox" checked> 同步缩放与拖拽</label>
+        <button id="compareFitBtn">两侧适应</button>
+        <button id="compareSwapBtn">交换左右</button>
+        <button id="compareCloseBtn" class="danger">关闭</button>
+      </div>
+    </header>
+    <div class="compare-grid">
+      <article class="compare-pane" data-side="left">
+        <div class="compare-pane-toolbar">
+          <select id="compareLeftView" aria-label="左侧视野"></select>
+          <select id="compareLeftChannel" aria-label="左侧通道">
+            <option value="overlay">合并图</option><option value="dapi">DAPI</option>
+            <option value="nk">NK</option><option value="tumor">肿瘤</option>
+          </select>
+          <span id="compareLeftZoom">100%</span>
+        </div>
+        <div id="compareLeftViewer" class="compare-viewer">
+          <div id="compareLeftStage" class="compare-stage">
+            <canvas id="compareLeftImage"></canvas><canvas id="compareLeftOverlay"></canvas>
+          </div>
+          <div id="compareLeftEmpty" class="compare-empty">请选择视野</div>
+          <div id="compareLeftStats" class="compare-stats"></div>
+        </div>
+      </article>
+      <article class="compare-pane" data-side="right">
+        <div class="compare-pane-toolbar">
+          <select id="compareRightView" aria-label="右侧视野"></select>
+          <select id="compareRightChannel" aria-label="右侧通道">
+            <option value="overlay">合并图</option><option value="dapi">DAPI</option>
+            <option value="nk">NK</option><option value="tumor">肿瘤</option>
+          </select>
+          <span id="compareRightZoom">100%</span>
+        </div>
+        <div id="compareRightViewer" class="compare-viewer">
+          <div id="compareRightStage" class="compare-stage">
+            <canvas id="compareRightImage"></canvas><canvas id="compareRightOverlay"></canvas>
+          </div>
+          <div id="compareRightEmpty" class="compare-empty">请选择视野</div>
+          <div id="compareRightStats" class="compare-stats"></div>
+        </div>
+      </article>
+    </div>
+    <footer class="compare-help">滚轮缩放 · 左键拖拽 · 双击适应窗口；同步模式按相同图像坐标对齐，适合比较同尺寸视野。</footer>
+  </section>
+  <script src="static/vendor/UTIF.min.js?v=20260901-dapi-calibration1"></script>
+  <script src="browser-learning.js?v=20260901-dapi-calibration1"></script>
+  <script src="browser-app.js?v=20260901-dapi-calibration1"></script>
+</body>
+</html>
